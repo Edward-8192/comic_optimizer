@@ -1,6 +1,7 @@
 import os
 import sys
 import re
+import html
 import shutil
 import zipfile
 import subprocess
@@ -11,9 +12,10 @@ import select
 import termios
 import tty
 import threading
+import urllib.parse
 from pathlib import Path
 from datetime import datetime
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from PIL import Image, ImageOps
 
 from rich import box
@@ -37,7 +39,7 @@ MAX_WIDTH = 3840
 MAX_HEIGHT = 2160
 JPEG_QUALITY = 85
 
-MAX_RAM_RETRIES = 3            # 暫時放不進 RAM 的最大重試次數，超過才迫降 SSD
+MAX_RAM_RETRIES = 5            # 彈性模式下，放不進 RAM 的最大重試次數
 RAM_DISK_MOUNT = Path("/Volumes/ComicRamDisk")
 
 ARCHIVE_EXTENSIONS = {'.zip', '.rar', '.7z', '.cbz', '.cbr'}
@@ -47,11 +49,286 @@ MEDIA_EXTS = {
     '.mp3', '.flac', '.wav', '.m4a', '.aac', '.ogg'
 }
 
+# 系統產出目錄前綴（包含歷史任何日期的目錄皆會被略過）
+SYSTEM_DIR_PREFIXES = (
+    "Resized-",
+    "Comic-",
+    "Animated-",
+    "Media-",
+    "Processed-",
+    "FileErr-",
+    "Error-",
+)
+
 ARCHIVE_MAIN_EXT = '.cbz'
 ARCHIVE_OTHER_EXT = '.zip'
 
 SPINNER_CHARS = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
 # =================================================
+
+
+def find_7z_binary() -> str:
+    """自動探測 7zz (Homebrew sevenzip 預設) 或 7z"""
+    for binary in ["7zz", "7z"]:
+        if shutil.which(binary):
+            return binary
+    return "7z"
+
+SEVEN_ZIP_BIN = find_7z_binary()
+
+
+# ==================== E-Hentai 導航檢索生成模組 ====================
+def clean_to_query(line: str) -> str:
+    """清理標題字串，保留核心作者與標題/角色關鍵字"""
+    tags_to_remove = [
+        r'\[\s*(AI Generated|REQUEST)\s*\]',
+        r'\(\s*(AI Generated|REQUEST)\s*\)',
+        r'\[\s*(Patreon|Unifans)\s*\]',
+        r'\(\s*(Patreon|Unifans)\s*\)',
+        r'\[\s*UNCENSORED\s*\]',
+        r'\(\s*UNCENSORED\s*\)',
+        r'\b(AI Generated|Uncensored|copy|拷貝)\b',
+        r'\(?\b\d+\s*(P|PICS|IMAGES|PAGES)\b\)?',
+    ]
+    cleaned = line
+    for pattern in tags_to_remove:
+        cleaned = re.sub(pattern, ' ', cleaned, flags=re.IGNORECASE)
+
+    cleaned = re.sub(r'\[[上下]篇\]', ' ', cleaned)
+    cleaned = re.sub(r'[\[\]\(\)（）︱|\\/\-–—~～]', ' ', cleaned)
+    return ' '.join(cleaned.split())
+
+
+def generate_eh_search_html(records: list, output_filepath: Path):
+    """產出支援即時篩選、深淺色切換的 E-Hentai 搜尋導航 HTML"""
+    rows_html = []
+    for idx, (original, query, eh_url) in enumerate(records, 1):
+        safe_orig = html.escape(original)
+        safe_query = html.escape(query)
+        rows_html.append(f"""
+        <tr>
+            <td class="text-center">{idx}</td>
+            <td class="orig-text">{safe_orig}</td>
+            <td class="query-text"><code>{safe_query}</code></td>
+            <td class="text-center">
+                <a href="{eh_url}" target="_blank" rel="noopener noreferrer" class="search-btn">
+                    在 E-Hentai 搜尋
+                </a>
+            </td>
+        </tr>
+        """)
+
+    table_rows = "\n".join(rows_html)
+
+    html_content = f"""<!DOCTYPE html>
+<html lang="zh-Hant" data-theme="dark">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>E-Hentai 損毀檔案重搜導航表</title>
+    <style>
+        :root {{
+            --bg-color: #f7f9fb;
+            --card-bg: #ffffff;
+            --primary: #4f46e5;
+            --primary-hover: #4338ca;
+            --text-color: #1f2937;
+            --subtext-color: #6b7280;
+            --border-color: #e5e7eb;
+            --table-header-bg: #f9fafb;
+            --table-row-hover: #f8fafc;
+            --code-bg: #f3f4f6;
+            --code-text: #1f2937;
+            --visited-btn: #9ca3af;
+        }}
+        [data-theme="dark"] {{
+            --bg-color: #0f172a;
+            --card-bg: #1e293b;
+            --primary: #6366f1;
+            --primary-hover: #818cf8;
+            --text-color: #f1f5f9;
+            --subtext-color: #94a3b8;
+            --border-color: #334155;
+            --table-header-bg: #0f172a;
+            --table-row-hover: #273549;
+            --code-bg: #0f172a;
+            --code-text: #38bdf8;
+            --visited-btn: #64748b;
+        }}
+        body {{
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+            background-color: var(--bg-color);
+            color: var(--text-color);
+            margin: 0;
+            padding: 24px;
+            transition: background-color 0.2s ease, color 0.2s ease;
+        }}
+        .container {{
+            max-width: 1200px;
+            margin: 0 auto;
+            background: var(--card-bg);
+            padding: 24px;
+            border-radius: 12px;
+            box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.2);
+            border: 1px solid var(--border-color);
+        }}
+        header {{
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            flex-wrap: wrap;
+            gap: 16px;
+            margin-bottom: 20px;
+            padding-bottom: 16px;
+            border-bottom: 1px solid var(--border-color);
+        }}
+        h1 {{
+            margin: 0;
+            font-size: 1.5rem;
+            color: var(--text-color);
+        }}
+        .header-controls {{
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            flex-wrap: wrap;
+        }}
+        .search-box input {{
+            width: 260px;
+            padding: 8px 12px;
+            background: var(--bg-color);
+            color: var(--text-color);
+            border: 1px solid var(--border-color);
+            border-radius: 6px;
+            font-size: 0.95rem;
+            outline: none;
+            box-sizing: border-box;
+        }}
+        .search-box input:focus {{
+            border-color: var(--primary);
+            box-shadow: 0 0 0 2px rgba(99, 102, 241, 0.25);
+        }}
+        .theme-btn {{
+            background: var(--bg-color);
+            border: 1px solid var(--border-color);
+            color: var(--text-color);
+            padding: 8px 14px;
+            border-radius: 6px;
+            cursor: pointer;
+            font-size: 0.9rem;
+        }}
+        table {{
+            width: 100%;
+            border-collapse: collapse;
+            font-size: 0.95rem;
+        }}
+        th, td {{
+            padding: 12px 14px;
+            text-align: left;
+            border-bottom: 1px solid var(--border-color);
+        }}
+        th {{
+            background-color: var(--table-header-bg);
+            font-weight: 600;
+            position: sticky;
+            top: 0;
+        }}
+        tr:hover td {{
+            background-color: var(--table-row-hover);
+        }}
+        .text-center {{
+            text-align: center;
+        }}
+        .orig-text {{
+            word-break: break-all;
+        }}
+        .query-text code {{
+            background-color: var(--code-bg);
+            color: var(--code-text);
+            padding: 3px 6px;
+            border-radius: 4px;
+            font-size: 0.9rem;
+            border: 1px solid var(--border-color);
+        }}
+        .search-btn {{
+            display: inline-block;
+            background-color: var(--primary);
+            color: #ffffff;
+            text-decoration: none;
+            padding: 6px 14px;
+            border-radius: 6px;
+            font-weight: 500;
+            font-size: 0.88rem;
+            white-space: nowrap;
+            transition: all 0.2s ease;
+        }}
+        .search-btn:hover {{
+            background-color: var(--primary-hover);
+        }}
+        .search-btn:visited {{
+            background-color: var(--visited-btn);
+            color: #e2e8f0;
+        }}
+        .badge {{
+            font-size: 0.85rem;
+            color: var(--subtext-color);
+            margin-left: 8px;
+        }}
+    </style>
+</head>
+<body>
+    <div class="container">
+        <header>
+            <div>
+                <h1>E-Hentai 損毀檔案檢索清單 <span class="badge">共 {len(records)} 筆</span></h1>
+            </div>
+            <div class="header-controls">
+                <div class="search-box">
+                    <input type="text" id="filterInput" placeholder="即時篩選關鍵字..." onkeyup="filterTable()">
+                </div>
+                <button class="theme-btn" onclick="toggleTheme()" id="themeBtn">☀️ 切換淺色</button>
+            </div>
+        </header>
+
+        <table id="linksTable">
+            <thead>
+                <tr>
+                    <th style="width: 50px;" class="text-center">#</th>
+                    <th style="width: 45%;">原始檔案名稱</th>
+                    <th style="width: 35%;">清洗後檢索關鍵字</th>
+                    <th style="width: 15%;" class="text-center">動作</th>
+                </tr>
+            </thead>
+            <tbody>
+                {table_rows}
+            </tbody>
+        </table>
+    </div>
+
+    <script>
+        function setTheme(theme) {{
+            document.documentElement.setAttribute('data-theme', theme);
+            const btn = document.getElementById('themeBtn');
+            btn.innerHTML = (theme === 'dark') ? '☀️ 切換淺色' : '🌙 切換深色';
+        }}
+        function toggleTheme() {{
+            const current = document.documentElement.getAttribute('data-theme');
+            setTheme(current === 'dark' ? 'light' : 'dark');
+        }}
+        function filterTable() {{
+            const input = document.getElementById("filterInput").value.toLowerCase();
+            const rows = document.querySelectorAll("#linksTable tbody tr");
+            rows.forEach(row => {{
+                row.style.display = row.innerText.toLowerCase().includes(input) ? "" : "none";
+            }});
+        }}
+        setTheme('dark');
+    </script>
+</body>
+</html>
+"""
+    output_filepath.write_text(html_content, encoding="utf-8")
+# ====================================================================
 
 
 class KeyAbortListener:
@@ -102,54 +379,23 @@ class KeyAbortListener:
         self.restore_terminal()
 
 
-def calculate_dynamic_ram_disk_gb(num_workers: int) -> int:
-    """
-    激進型動態 RAM Disk 計算引擎：
-    充分釋放 Apple Silicon 統一記憶體優勢，大幅拉高配額，避免大量檔案退回 SSD。
-    """
+def get_recommended_ram_disk_gb() -> int:
+    """評估系統實體記憶體並給出建議 RAM Disk 容量 (GB)"""
     try:
         mem_bytes = int(subprocess.check_output(["sysctl", "-n", "hw.memsize"]).strip())
         total_ram_gb = mem_bytes / (1024 ** 3)
-
-        vm = subprocess.check_output(["vm_stat"]).decode()
-        page_size_match = re.search(r'page size of (\d+) bytes', vm)
-        page_size = int(page_size_match.group(1)) if page_size_match else 4096
-
-        def get_pages(key):
-            m = re.search(rf'{key}:\s+(\d+)\.', vm)
-            return int(m.group(1)) if m else 0
-
-        free_pages = get_pages("Pages free")
-        inactive_pages = get_pages("Pages inactive")
-        spec_pages = get_pages("Pages speculative")
-        purgeable_pages = get_pages("Pages purgeable")
-        
-        # 實質可回收/可複寫空間（Free + Inactive + Speculative + Purgeable）
-        available_gb = ((free_pages + inactive_pages + spec_pages + purgeable_pages) * page_size) / (1024 ** 3)
-
-        # 激進策略：
-        # 針對 24GB 機型：若當前非極端吃緊（可用 >= 6GB），直接配置 12GB ~ 14GB！
-        if total_ram_gb >= 24.0:
-            if available_gb >= 8.0:
-                target_gb = 14
-            elif available_gb >= 5.0:
-                target_gb = 10
-            else:
-                target_gb = 6
+        if total_ram_gb >= 64.0:
+            return 36
+        elif total_ram_gb >= 36.0:
+            return 20
+        elif total_ram_gb >= 24.0:
+            return 14
         elif total_ram_gb >= 16.0:
-            if available_gb >= 6.0:
-                target_gb = 8
-            elif available_gb >= 4.0:
-                target_gb = 6
-            else:
-                target_gb = 4
+            return 9
         else:
-            target_gb = max(2, int(available_gb * 0.6))
-
-        return target_gb
-
+            return 4
     except Exception:
-        return 8
+        return 12
 
 
 def setup_ram_disk(size_gb: int) -> Path:
@@ -197,8 +443,8 @@ def get_ram_disk_usage():
         return "未知", 0.0
 
 
-def get_uncompressed_size_mb(archive_path: Path) -> float:
-    """快速讀取壓縮檔未壓縮大小 (MB)"""
+def get_uncompressed_size_mb_fast(archive_path: Path) -> float:
+    """高速零 I/O 預檢：ZIP 走內建解析，RAR/7Z 走優化後的 7zz 指令"""
     ext = archive_path.suffix.lower()
     total_bytes = 0
     try:
@@ -207,15 +453,20 @@ def get_uncompressed_size_mb(archive_path: Path) -> float:
                 total_bytes = sum(zinfo.file_size for zinfo in zf.infolist())
         elif ext in ('.rar', '.cbr', '.7z'):
             res = subprocess.run(
-                ["7z", "l", "-slt", str(archive_path)],
+                [SEVEN_ZIP_BIN, "l", "-p-", str(archive_path)],
                 stdout=subprocess.PIPE,
                 stderr=subprocess.DEVNULL,
                 text=True
             )
-            sizes = re.findall(r'^Size = (\d+)', res.stdout, re.MULTILINE)
-            if sizes:
-                parsed_sizes = [int(s) for s in sizes]
-                total_bytes = max(parsed_sizes) if len(parsed_sizes) == 1 else sum(parsed_sizes[1:])
+            lines = res.stdout.strip().splitlines()
+            for line in reversed(lines):
+                parts = line.split()
+                for part in parts:
+                    if part.isdigit() and int(part) > 1024:
+                        total_bytes = int(part)
+                        break
+                if total_bytes > 0:
+                    break
     except Exception:
         total_bytes = archive_path.stat().st_size * 2.0
 
@@ -223,6 +474,15 @@ def get_uncompressed_size_mb(archive_path: Path) -> float:
         total_bytes = archive_path.stat().st_size * 2.0
 
     return total_bytes / (1024 * 1024)
+
+
+def inspect_archive_worker(arch: Path):
+    """供 ThreadPool 平行預檢調用的工作單元"""
+    return {
+        "path": arch,
+        "uncompressed_mb": get_uncompressed_size_mb_fast(arch),
+        "retries": 0
+    }
 
 
 def natural_sort_key(s):
@@ -287,13 +547,16 @@ def extract_archive_stream(archive_path: Path, extract_dir: Path, progress_callb
                 return False, "CORRUPTED"
 
         elif ext in ('.rar', '.cbr', '.7z'):
-            cmd = ["7z", "x", str(archive_path), f"-o{extract_dir}", "-y", "-bsp1"]
-            proc = subprocess.Popen(
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                universal_newlines=True
-            )
+            cmd = [SEVEN_ZIP_BIN, "x", str(archive_path), f"-o{extract_dir}", "-y", "-p-", "-bsp1"]
+            try:
+                proc = subprocess.Popen(
+                    cmd,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    universal_newlines=True
+                )
+            except FileNotFoundError:
+                return False, "CORRUPTED"
 
             pct_pattern = re.compile(r'(\d+)%')
             current_pct = 0.0
@@ -374,7 +637,7 @@ def format_bytes(size_bytes: int) -> str:
     return f"{size_bytes} B"
 
 
-def execute_pipeline(archive_path, comic_dir, anim_dir, media_dir, processed_dir, temp_target_dir, tier_tag, worker_id, status_dict):
+def execute_pipeline(archive_path, resized_dir, anim_dir, media_dir, processed_dir, temp_target_dir, tier_tag, worker_id, status_dict):
     stem_name = archive_path.stem
 
     def update_extract_progress(ratio: float, elapsed: float):
@@ -456,7 +719,7 @@ def execute_pipeline(archive_path, comic_dir, anim_dir, media_dir, processed_dir
             "detail": "STORE 寫入"
         }
         if processed_images:
-            create_zip_store(comic_dir / f"{stem_name}{ARCHIVE_MAIN_EXT}", processed_images)
+            create_zip_store(resized_dir / f"{stem_name}{ARCHIVE_MAIN_EXT}", processed_images)
         if animated_images:
             create_zip_store(anim_dir / f"{stem_name}-Animated{ARCHIVE_OTHER_EXT}", animated_images)
         if media_files:
@@ -477,7 +740,7 @@ def worker_task(
     archive_path_str: str,
     target_tier: str,
     reserved_mb: float,
-    comic_dir_str: str,
+    resized_dir_str: str,
     anim_dir_str: str,
     media_dir_str: str,
     processed_dir_str: str,
@@ -489,7 +752,7 @@ def worker_task(
     ram_manager_tuple
 ):
     archive_path = Path(archive_path_str)
-    comic_dir = Path(comic_dir_str)
+    resized_dir = Path(resized_dir_str)
     anim_dir = Path(anim_dir_str)
     media_dir = Path(media_dir_str)
     processed_dir = Path(processed_dir_str)
@@ -508,7 +771,7 @@ def worker_task(
     start_task_time = time.time()
     try:
         ok, reason, img_count = execute_pipeline(
-            archive_path, comic_dir, anim_dir, media_dir, processed_dir,
+            archive_path, resized_dir, anim_dir, media_dir, processed_dir,
             temp_target_dir, tier_tag, worker_id, status_dict
         )
 
@@ -516,7 +779,7 @@ def worker_task(
             recent_logs.append(f"[bold yellow]⚠️ RAM Disk 突發空間不足，轉用 SSD: [/bold yellow]{archive_path.name}")
             tier_tag = "[yellow]SSD-重試[/yellow]"
             ok, reason, img_count = execute_pipeline(
-                archive_path, comic_dir, anim_dir, media_dir, processed_dir,
+                archive_path, resized_dir, anim_dir, media_dir, processed_dir,
                 None, tier_tag, worker_id, status_dict
             )
             if not ok:
@@ -556,7 +819,7 @@ def create_mini_bar(pct: float, width=12) -> str:
     return f"[cyan]{bar_str}[/cyan] [bold white]{int(pct * 100):3d}%[/bold white]"
 
 
-def build_enhanced_dashboard(progress, worker_statuses, recent_logs, num_workers, ram_active: bool, ram_disk_gb: int):
+def build_enhanced_dashboard(progress, worker_statuses, recent_logs, num_workers, ram_active: bool, ram_disk_gb: int, strict_ram_mode: bool):
     worker_table = Table(box=box.SIMPLE, expand=True, pad_edge=False, show_header=True)
     worker_table.add_column("核心", style="bold cyan", width=7, justify="center")
     worker_table.add_column("層級", width=10, justify="center")
@@ -600,13 +863,17 @@ def build_enhanced_dashboard(progress, worker_statuses, recent_logs, num_workers
 
     ram_usage_text, ram_pct = get_ram_disk_usage()
     ram_style = "bold red" if ram_pct > 85 else ("bold yellow" if ram_pct > 60 else "bold green")
+    mode_text = "[bold green]RAM 獨占[/bold green]" if strict_ram_mode else "[yellow]RAM 彈性[/yellow]"
 
-    header_info = Text.assemble(
-        ("  ⚡ 核心: ", "dim"), (f"{num_workers}C  ", "bold cyan"),
-        ("│  💾 RAM Disk: ", "dim"), (f"{ram_disk_gb}GB ({ram_usage_text})  ", ram_style),
-        ("│  ⌨️  中止熱鍵: ", "dim"), ("[bold red]連續輸入 qqq[/bold red]  ", "bold white"),
-        ("│  ⚙️ 規格: ", "dim"), (f"4K STORE  ", "bold magenta"),
+    # 使用 Text.from_markup() 確保標籤正確解析為終端機色彩
+    header_markup = (
+        f"  [dim]⚡ 核心:[/dim] [bold cyan]{num_workers}C[/bold cyan]  "
+        f"│  [dim]💾 RAM Disk:[/dim] [{ram_style}]{ram_disk_gb}GB ({ram_usage_text})[/{ram_style}]  "
+        f"│  [dim]🎯 策略:[/dim] {mode_text}  "
+        f"│  [dim]⌨️  熱鍵:[/dim] [bold red]qqq 中止[/bold red]  "
+        f"│  [dim]⚙️ 引擎:[/dim] [bold magenta]{SEVEN_ZIP_BIN} STORE[/bold magenta]"
     )
+    header_info = Text.from_markup(header_markup)
 
     layout = Layout()
     layout.split_column(
@@ -623,14 +890,14 @@ def build_enhanced_dashboard(progress, worker_statuses, recent_logs, num_workers
 
 def print_summary_card(
     console, total_time_sec, total_count, success_count, fail_err_count, corrupted_count,
-    comic_dir, anim_dir, media_dir, processed_dir, error_dir, file_err_dir, file_err_stems, aborted=False
+    resized_dir, anim_dir, media_dir, processed_dir, error_dir, file_err_dir, file_err_stems, aborted=False
 ):
     processed_bytes = get_dir_size_bytes(processed_dir)
-    comic_bytes = get_dir_size_bytes(comic_dir)
+    resized_bytes = get_dir_size_bytes(resized_dir)
     anim_bytes = get_dir_size_bytes(anim_dir)
     media_bytes = get_dir_size_bytes(media_dir)
 
-    output_total_bytes = comic_bytes + anim_bytes + media_bytes
+    output_total_bytes = resized_bytes + anim_bytes + media_bytes
     saved_bytes = processed_bytes - output_total_bytes
     pct_saved = (saved_bytes / processed_bytes * 100) if processed_bytes > 0 else 0.0
 
@@ -660,7 +927,7 @@ def print_summary_card(
 
     summary_text.append(f"💾 空間節省統計:\n", style="bold yellow")
     summary_text.append(f"   • 已歸檔原檔體積 (Processed) : {format_bytes(processed_bytes)}\n", style="white")
-    summary_text.append(f"   • 最佳化成品體積 (Comic+其他) : {format_bytes(output_total_bytes)}\n", style="white")
+    summary_text.append(f"   • 最佳化成品體積 (Resized+其他): {format_bytes(output_total_bytes)}\n", style="white")
     if saved_bytes > 0:
         summary_text.append(f"   • 空間縮減 (節省容量)         : ", style="white")
         summary_text.append(f"{format_bytes(saved_bytes)} (▼ {pct_saved:.1f}%)\n", style="bold green")
@@ -668,8 +935,8 @@ def print_summary_card(
         summary_text.append(f"   • 空間變化                    : 原圖尺寸較小或已為高度壓縮檔\n", style="dim")
 
     summary_text.append(f"\n📂 目錄產出狀態:\n", style="bold cyan")
-    if comic_dir.exists():
-        summary_text.append(f"   • 📖 漫畫書庫 : {comic_dir} ({format_bytes(comic_bytes)})\n", style="white")
+    if resized_dir.exists():
+        summary_text.append(f"   • 📖 漫畫書庫 : {resized_dir} ({format_bytes(resized_bytes)})\n", style="white")
     if anim_dir.exists():
         summary_text.append(f"   • 🎬 動態圖片 : {anim_dir} ({format_bytes(anim_bytes)})\n", style="white")
     if media_dir.exists():
@@ -677,13 +944,28 @@ def print_summary_card(
     if processed_dir.exists():
         summary_text.append(f"   • 📦 原檔歸檔 : {processed_dir} ({format_bytes(processed_bytes)})\n", style="white")
     
+    # 輸出 FileErr 純檔名清單檔及 E-Hentai 搜尋導航 HTML[cite: 1]
     if file_err_dir.exists() and corrupted_count > 0:
         list_file = file_err_dir / "corrupted_list.txt"
+        html_file = file_err_dir / "corrupted_search.html"
         try:
             sorted_stems = sorted(list(set(file_err_stems)), key=natural_sort_key)
             list_file.write_text("\n".join(sorted_stems), encoding="utf-8")
+
+            records = []
+            for raw_stem in sorted_stems:
+                q = clean_to_query(raw_stem)
+                if q:
+                    encoded_q = urllib.parse.quote_plus(q)
+                    eh_url = f"https://e-hentai.org/?f_search={encoded_q}&f_cats=0"
+                    records.append((raw_stem, q, eh_url))
+
+            if records:
+                generate_eh_search_html(records, html_file)
+
             summary_text.append(f"   • 🛑 損毀檔案 : {file_err_dir} ({corrupted_count} 個損毀檔)\n", style="bold red")
-            summary_text.append(f"     └─ 📑 清單已儲存至: {list_file.name} (無副檔名)\n", style="dim")
+            summary_text.append(f"     ├─ 📑 清單已儲存至: {list_file.name} (無副檔名)\n", style="dim")
+            summary_text.append(f"     └─ 🌐 導航已儲存至: {html_file.name} (E-Hentai 搜尋導航表)\n", style="bold magenta")
         except Exception:
             summary_text.append(f"   • 🛑 損毀檔案 : {file_err_dir} ({corrupted_count} 個損毀檔)\n", style="bold red")
 
@@ -693,6 +975,14 @@ def print_summary_card(
     card_title = "[bold red]🛑 任務中止結算報告 (Aborted)[/bold red]" if aborted else "[bold green]🎉 處理成果結算報告 (Summary Report)[/bold green]"
     border_style = "red" if aborted else "green"
     console.print(Panel(summary_text, title=card_title, border_style=border_style, expand=False))
+
+
+def is_system_generated_path(path: Path) -> bool:
+    """檢查路徑中的任何層級是否符合本工具產出的目錄前綴"""
+    for part in path.parts:
+        if part.startswith(SYSTEM_DIR_PREFIXES):
+            return True
+    return False
 
 
 def main():
@@ -709,41 +999,65 @@ def main():
         sys.exit(1)
 
     today_str = datetime.now().strftime("%Y-%m-%d")
-    comic_dir = source_dir / f"Comic-{today_str}"
+    resized_dir = source_dir / f"Resized-{today_str}"
     anim_dir = source_dir / f"Animated-{today_str}"
     media_dir = source_dir / f"Media-{today_str}"
     processed_dir = source_dir / f"Processed-{today_str}"
     error_dir = source_dir / f"Error-{today_str}"
     file_err_dir = source_dir / f"FileErr-{today_str}"
 
-    output_dir_names = {
-        comic_dir.name, anim_dir.name, media_dir.name,
-        processed_dir.name, error_dir.name, file_err_dir.name
-    }
+    # 全面過濾本工具過去產生的所有歷史資料夾
     archive_files = [
         p for p in source_dir.rglob("*")
         if p.is_file() 
         and p.suffix.lower() in ARCHIVE_EXTENSIONS 
         and not p.name.startswith("._")
-        and not any(part in output_dir_names for part in p.parts)
+        and not is_system_generated_path(p)
     ]
 
     if not archive_files:
-        console.print("[yellow]未找到任何待處理的壓縮檔案（可能已全數歸檔）。[/yellow]")
+        console.print("[yellow]未找到任何待處理的壓縮檔案（可能已全數歸檔或全部屬於已處理目錄）。[/yellow]")
         return
 
     num_workers = max(1, os.cpu_count() - 1)
 
-    # 1. 激進型動態評估安全 RAM Disk 大小 (在 24GB 上配置 10~14GB)
-    console.print("[cyan]🔍 正在評估系統可用記憶體（激進釋放模式）...[/cyan]")
-    dynamic_ram_gb = calculate_dynamic_ram_disk_gb(num_workers)
-    ram_path = setup_ram_disk(dynamic_ram_gb)
-    ram_active = ram_path is not None
+    # 1. 互動式手動設定 RAM Disk 大小
+    suggested_gb = get_recommended_ram_disk_gb()
+    user_ram_input = console.input(
+        f"[bold yellow]請輸入欲配置的 RAM Disk 大小 (GB) [建議: {suggested_gb}，輸入 0 則不使用]: [/bold yellow]"
+    ).strip()
 
-    if ram_active:
-        console.print(f"[bold green]✔ 已配置高容量 {dynamic_ram_gb} GB RAM Disk，啟動激進型記憶體排程！[/bold green]")
+    if user_ram_input == "":
+        ram_disk_gb = suggested_gb
     else:
-        console.print("[yellow]⚠ 系統可用記憶體緊張，將全面使用系統 SSD 進行暫存。[/yellow]")
+        try:
+            ram_disk_gb = max(0, int(user_ram_input))
+        except ValueError:
+            console.print(f"[yellow]輸入格式無效，自動採用建議值: {suggested_gb} GB[/yellow]")
+            ram_disk_gb = suggested_gb
+
+    strict_ram_mode = False
+    if ram_disk_gb > 0:
+        strict_input = console.input(
+            "[bold yellow]是否啟用「純 RAM 模式」？(空間不足時持續等待前一任務完成，不退回 SSD) \[Y/n]: [/bold yellow]"
+        ).strip().lower()
+
+        if strict_input == "" or strict_input in ('y', 'yes'):
+            strict_ram_mode = True
+        else:
+            strict_ram_mode = False
+
+        console.print(f"[cyan]🔍 正在初始化 {ram_disk_gb} GB RAM Disk 環境...[/cyan]")
+        ram_path = setup_ram_disk(ram_disk_gb)
+        ram_active = ram_path is not None
+        if ram_active:
+            mode_desc = "純 RAM 獨占排程 (保護 SSD)" if strict_ram_mode else "RAM 彈性排程 (超限走 SSD)"
+            console.print(f"[bold green]✔ 已成功配置 {ram_disk_gb} GB RAM Disk！模式: {mode_desc}[/bold green]")
+        else:
+            console.print("[yellow]⚠ RAM Disk 建立失敗，將直接使用系統 SSD 進行暫存。[/yellow]")
+    else:
+        ram_active = False
+        console.print("[yellow]⚡ 已設定為 0 GB，本次作業將全面走本機 SSD 執行。[/yellow]")
 
     # 2. 空間記帳員狀態
     manager = multiprocessing.Manager()
@@ -753,25 +1067,51 @@ def main():
     for i in range(num_workers):
         worker_statuses[i] = {"tier": "[dim]-[/dim]", "stage": "閒置", "name": "-", "progress": 0.0, "detail": ""}
 
-    # RAM 記帳員：保留 10% 空間餘量即可（極大化利用）
-    ram_budget_mb = (dynamic_ram_gb * 1024 * 0.90) if ram_active else 0.0
+    ram_budget_mb = (ram_disk_gb * 1024 * 0.96) if ram_active else 0.0
     current_allocated_ram = manager.Value('d', 0.0)
     ram_lock = manager.Lock()
     ram_manager_tuple = (current_allocated_ram, ram_budget_mb, ram_lock)
 
-    # 3. 檔案前置預檢
-    console.print("[cyan]📑 正在進行檔案展開尺寸預檢...[/cyan]")
+    # 3. 多執行緒平行前置預檢 (搭配即時動態進度條)
     pending_queue = []
-    for arch in archive_files:
-        uncompressed_mb = get_uncompressed_size_mb(arch)
-        pending_queue.append({
-            "path": arch,
-            "uncompressed_mb": uncompressed_mb,
-            "retries": 0
-        })
+    max_inspect_threads = min(32, (os.cpu_count() or 4) * 4)
 
-    # 大小穿插交錯排序
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[bold cyan]📑 檔案展開尺寸預檢[/bold cyan]"),
+        BarColumn(bar_width=None),
+        MofNCompleteColumn(),
+        TextColumn("•"),
+        TimeRemainingColumn(),
+        TextColumn("[dim]{task.fields[current_file]}[/dim]"),
+        console=console
+    ) as inspect_progress:
+        inspect_task = inspect_progress.add_task(
+            "inspect", total=len(archive_files), current_file="準備中..."
+        )
+        
+        with ThreadPoolExecutor(max_workers=max_inspect_threads) as inspector:
+            future_to_arch = {
+                inspector.submit(inspect_archive_worker, arch): arch
+                for arch in archive_files
+            }
+            
+            for future in as_completed(future_to_arch):
+                arch = future_to_arch[future]
+                short_name = arch.name if len(arch.name) <= 28 else arch.name[:12] + "..." + arch.name[-13:]
+                try:
+                    res = future.result()
+                    pending_queue.append(res)
+                except Exception:
+                    pending_queue.append({
+                        "path": arch,
+                        "uncompressed_mb": arch.stat().st_size * 2.0 / (1024 * 1024),
+                        "retries": 0
+                    })
+                inspect_progress.update(inspect_task, advance=1, current_file=short_name)
+
     pending_queue.sort(key=lambda x: x["uncompressed_mb"], reverse=True)
+    console.print("[bold green]✔ 檔案尺寸預檢完成！[/bold green]\n")
 
     progress = Progress(
         SpinnerColumn(),
@@ -781,9 +1121,8 @@ def main():
         TextColumn("•"),
         TimeRemainingColumn(),
     )
-    task_id = progress.add_task("壓縮檔排程 (可隨時輸入 qqq 中止)...", total=len(archive_files))
+    task_id = progress.add_task("壓縮檔排程 (隨時輸入 qqq 中止)...", total=len(archive_files))
 
-    # 啟動 qqq 鍵盤監聽器
     abort_listener = KeyAbortListener()
     abort_listener.start()
 
@@ -798,17 +1137,15 @@ def main():
 
     try:
         with Live(
-            build_enhanced_dashboard(progress, worker_statuses, recent_logs, num_workers, ram_active, dynamic_ram_gb),
+            build_enhanced_dashboard(progress, worker_statuses, recent_logs, num_workers, ram_active, ram_disk_gb, strict_ram_mode),
             refresh_per_second=4,
             console=console
         ) as live:
             with ProcessPoolExecutor(max_workers=num_workers) as executor:
                 while (pending_queue or active_futures) and not was_aborted:
-                    # 檢查使用者是否連續輸入 qqq
                     if abort_listener.aborted:
                         was_aborted = True
-                        recent_logs.append("[bold red]🛑 接收到 qqq 中止指令，正在強制停止工作核心...[/bold red]")
-                        # 中止所有執行中 Worker
+                        recent_logs.append("[bold red]🛑 接收到 qqq 指令，停止所有工作核心...[/bold red]")
                         for p in executor._processes.values():
                             try:
                                 p.terminate()
@@ -816,7 +1153,6 @@ def main():
                                 pass
                         break
 
-                    # 收集已完成的任務
                     done_futures = [f for f in active_futures if f.done()]
                     for f in done_futures:
                         worker_id = active_futures.pop(f)
@@ -836,7 +1172,6 @@ def main():
 
                         progress.advance(task_id, 1)
 
-                    # 派發新任務
                     while available_workers and pending_queue and not was_aborted:
                         if abort_listener.aborted:
                             was_aborted = True
@@ -846,7 +1181,6 @@ def main():
                         for idx, item in enumerate(pending_queue):
                             needed_mb = item["uncompressed_mb"]
                             
-                            # 判定 1: 物理上超越整顆 RAM Disk 總額度
                             if not ram_active or needed_mb > ram_budget_mb:
                                 target_tier = "SSD"
                                 reserved_mb = 0.0
@@ -854,7 +1188,6 @@ def main():
                                 assigned = True
                                 break
 
-                            # 判定 2: 向記帳員申請空間
                             can_allocate = False
                             with ram_lock:
                                 if current_allocated_ram.value + needed_mb <= ram_budget_mb:
@@ -868,14 +1201,17 @@ def main():
                                 assigned = True
                                 break
                             else:
-                                if item["retries"] >= MAX_RAM_RETRIES:
-                                    target_tier = "SSD"
-                                    reserved_mb = 0.0
-                                    chosen_item = pending_queue.pop(idx)
-                                    assigned = True
-                                    break
+                                if strict_ram_mode:
+                                    continue
                                 else:
-                                    item["retries"] += 1
+                                    if item["retries"] >= MAX_RAM_RETRIES:
+                                        target_tier = "SSD"
+                                        reserved_mb = 0.0
+                                        chosen_item = pending_queue.pop(idx)
+                                        assigned = True
+                                        break
+                                    else:
+                                        item["retries"] += 1
 
                         if assigned:
                             worker_id = available_workers.pop()
@@ -884,7 +1220,7 @@ def main():
                                 str(chosen_item["path"]),
                                 target_tier,
                                 reserved_mb,
-                                str(comic_dir),
+                                str(resized_dir),
                                 str(anim_dir),
                                 str(media_dir),
                                 str(processed_dir),
@@ -900,18 +1236,18 @@ def main():
                             break
 
                     live.update(
-                        build_enhanced_dashboard(progress, worker_statuses, recent_logs, num_workers, ram_active, dynamic_ram_gb)
+                        build_enhanced_dashboard(progress, worker_statuses, recent_logs, num_workers, ram_active, ram_disk_gb, strict_ram_mode)
                     )
                     time.sleep(0.1)
 
     finally:
         abort_listener.stop()
-        console.print("\n[cyan]🧹 正在安全卸載 RAM Disk...[/cyan]")
-        cleanup_ram_disk()
+        if ram_active:
+            console.print("\n[cyan]🧹 正在安全卸載 RAM Disk...[/cyan]")
+            cleanup_ram_disk()
 
     global_cost = time.time() - global_start_time
 
-    # 印出成果結算報告卡片（含手動中止標記）
     print_summary_card(
         console,
         global_cost,
@@ -919,7 +1255,7 @@ def main():
         success_count,
         fail_err_count,
         corrupted_count,
-        comic_dir,
+        resized_dir,
         anim_dir,
         media_dir,
         processed_dir,
