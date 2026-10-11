@@ -88,6 +88,7 @@ python3 comic_optimizer.py
 
 執行完畢後，來源目錄會自動分類歸整：
 
+```text
 來源目錄/
 ├── Resized-YYYY-MM-DD/      # 轉檔後的 4K .cbz 漫畫書庫
 │   └── 航海王_105.cbz
@@ -101,6 +102,7 @@ python3 comic_optimizer.py
 │   ├── corrupted_list.txt   # 純文字書名清單 (無副檔名)
 │   └── corrupted_search.html# E-Hentai 搜尋導航網頁 (一鍵點擊補檔)
 └── Error-YYYY-MM-DD/        # 系統 / 轉檔執行異常 (隨需生成)
+```
 
 ---
 

@@ -88,6 +88,7 @@ Type qqq consecutively at any time in the terminal to safely stop the process an
 
 Upon completion, output subdirectories are generated within the source directory:
 
+```text
 Source_Directory/
 ├── Resized-YYYY-MM-DD/      # Processed 4K .cbz comic library
 │   └── OnePiece_105.cbz
@@ -101,6 +102,7 @@ Source_Directory/
 │   ├── corrupted_list.txt   # Plain list of corrupted filenames without extensions
 │   └── corrupted_search.html# Interactive E-Hentai search table for recovery
 └── Error-YYYY-MM-DD/        # System / runtime execution errors
+```
 
 ---
 
