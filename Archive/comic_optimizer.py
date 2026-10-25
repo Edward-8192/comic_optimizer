@@ -49,12 +49,13 @@ MEDIA_EXTS = {
     '.mp3', '.flac', '.wav', '.m4a', '.aac', '.ogg'
 }
 
-# 系統產出目錄前綴（包含歷史任何日期的目錄皆會被略過）
+# 系統產出目錄前綴（包含歷史任何日期的目錄皆會被略過，保留 Processed- 以相容舊目錄）
 SYSTEM_DIR_PREFIXES = (
     "Resized-",
     "Comic-",
     "Animated-",
     "Media-",
+    "OriginalFiles-",
     "Processed-",
     "FileErr-",
     "Error-",
@@ -63,8 +64,29 @@ SYSTEM_DIR_PREFIXES = (
 ARCHIVE_MAIN_EXT = '.cbz'
 ARCHIVE_OTHER_EXT = '.zip'
 
-SPINNER_CHARS = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
+SPINNER_CHARS = ["-", "\\", "|", "/"]
 # =================================================
+
+
+def sanitize_log_text(text: str) -> str:
+    """過濾會造成終端機字元寬度計算失真 (1 cell vs 2 cells) 的 Emoji 與特殊符號"""
+    emoji_pattern = re.compile(
+        "["
+        "\U0001F1E0-\U0001F1FF"
+        "\U0001F300-\U0001F5FF"
+        "\U0001F600-\U0001F64F"
+        "\U0001F680-\U0001F6FF"
+        "\U0001F700-\U0001F77F"
+        "\U0001F780-\U0001F7FF"
+        "\U0001F800-\U0001F8FF"
+        "\U0001F900-\U0001F9FF"
+        "\U0001FA00-\U0001FA6F"
+        "\U0001FA70-\U0001FAFF"
+        "\U00002702-\U000027B0"
+        "\U000024C2-\U0001F251" 
+        "]+", flags=re.UNICODE
+    )
+    return emoji_pattern.sub("", text)
 
 
 def find_7z_binary() -> str:
@@ -80,6 +102,7 @@ SEVEN_ZIP_BIN = find_7z_binary()
 # ==================== E-Hentai 導航檢索生成模組 ====================
 def clean_to_query(line: str) -> str:
     """清理標題字串，保留核心作者與標題/角色關鍵字"""
+    cleaned = sanitize_log_text(line)
     tags_to_remove = [
         r'\[\s*(AI Generated|REQUEST)\s*\]',
         r'\(\s*(AI Generated|REQUEST)\s*\)',
@@ -90,12 +113,11 @@ def clean_to_query(line: str) -> str:
         r'\b(AI Generated|Uncensored|copy|拷貝)\b',
         r'\(?\b\d+\s*(P|PICS|IMAGES|PAGES)\b\)?',
     ]
-    cleaned = line
     for pattern in tags_to_remove:
         cleaned = re.sub(pattern, ' ', cleaned, flags=re.IGNORECASE)
 
     cleaned = re.sub(r'\[[上下]篇\]', ' ', cleaned)
-    cleaned = re.sub(r'[\[\]\(\)（）︱|\\/\-–—~～]', ' ', cleaned)
+    cleaned = re.sub(r'[\[\]\(\)（）︱|\\/\-–—~～★☆◆◇▲△▼▽]', ' ', cleaned)
     return ' '.join(cleaned.split())
 
 
@@ -444,36 +466,21 @@ def get_ram_disk_usage():
 
 
 def get_uncompressed_size_mb_fast(archive_path: Path) -> float:
-    """高速零 I/O 預檢：ZIP 走內建解析，RAR/7Z 走優化後的 7zz 指令"""
+    """
+    極速零 I/O 預檢引擎：
+    1. ZIP / CBZ 讀取檔尾集中目錄表（原生記憶體操作，毫秒級完成）。
+    2. RAR / 7Z 採漫畫專用精準係數（實體大小 × 1.2 倍），徹底杜絕外部磁碟與 NAS 的尋軌延遲。
+    """
     ext = archive_path.suffix.lower()
-    total_bytes = 0
     try:
         if ext in ('.zip', '.cbz'):
             with zipfile.ZipFile(archive_path, 'r') as zf:
                 total_bytes = sum(zinfo.file_size for zinfo in zf.infolist())
-        elif ext in ('.rar', '.cbr', '.7z'):
-            res = subprocess.run(
-                [SEVEN_ZIP_BIN, "l", "-p-", str(archive_path)],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL,
-                text=True
-            )
-            lines = res.stdout.strip().splitlines()
-            for line in reversed(lines):
-                parts = line.split()
-                for part in parts:
-                    if part.isdigit() and int(part) > 1024:
-                        total_bytes = int(part)
-                        break
-                if total_bytes > 0:
-                    break
+                return total_bytes / (1024 * 1024)
+        else:
+            return (archive_path.stat().st_size * 1.2) / (1024 * 1024)
     except Exception:
-        total_bytes = archive_path.stat().st_size * 2.0
-
-    if total_bytes == 0:
-        total_bytes = archive_path.stat().st_size * 2.0
-
-    return total_bytes / (1024 * 1024)
+        return (archive_path.stat().st_size * 1.2) / (1024 * 1024)
 
 
 def inspect_archive_worker(arch: Path):
@@ -594,14 +601,45 @@ def extract_archive_stream(archive_path: Path, extract_dir: Path, progress_callb
         return False, "CORRUPTED"
 
 
-def create_zip_store(target_archive: Path, file_pairs: list):
+def create_zip_store(target_archive: Path, file_pairs: list, root_folder_name: str = None):
+    """
+    建立 ZIP_STORED 壓縮檔。
+    具備智慧路徑防呆：若指定 root_folder_name，僅在檔案散落於根目錄時補上一層資料夾，
+    避免解壓縮時出現『檔名/檔名/...』重複巢狀資料夾的問題。
+    """
     if not file_pairs:
         return
     target_archive.parent.mkdir(parents=True, exist_ok=True)
     file_pairs.sort(key=lambda x: natural_sort_key(x[1]))
+
+    # 1. 檢查這批檔案是否已經具備共同的單一頂層資料夾
+    needs_wrapper = False
+    if root_folder_name:
+        # 取得所有檔案在相對路徑下的第一層目錄名稱
+        top_dirs = set()
+        has_root_files = False
+        for _, arc_name in file_pairs:
+            parts = Path(arc_name).parts
+            if len(parts) > 1:
+                top_dirs.add(parts[0])
+            else:
+                has_root_files = True
+
+        # 若根目錄有散落檔案，或者頂層目錄不只一個，代表缺乏單一資料夾包裹
+        if has_root_files or len(top_dirs) > 1:
+            needs_wrapper = True
+        else:
+            # 如果內部已經有唯一頂層目錄，但名稱與我們要的不同，也可以視需求決定是否套用
+            needs_wrapper = False
+
+    # 2. 寫入 ZIP
     with zipfile.ZipFile(target_archive, 'w', compression=zipfile.ZIP_STORED) as zf:
         for disk_path, arc_name in file_pairs:
-            zf.write(disk_path, arcname=arc_name)
+            if needs_wrapper:
+                final_arc_name = f"{root_folder_name}/{arc_name}"
+            else:
+                final_arc_name = arc_name
+            zf.write(disk_path, arcname=final_arc_name)
 
 
 def safe_move_file(src_path: Path, dst_dir: Path):
@@ -637,7 +675,18 @@ def format_bytes(size_bytes: int) -> str:
     return f"{size_bytes} B"
 
 
-def execute_pipeline(archive_path, resized_dir, anim_dir, media_dir, processed_dir, temp_target_dir, tier_tag, worker_id, status_dict):
+def _process_single_page_task(args):
+    """供內部 ThreadPool 並行調用的單圖縮放工作單元"""
+    idx, img_path, rel_path, out_img_path = args
+    try:
+        resize_and_convert_image(img_path, out_img_path)
+        new_rel_path = str(Path(rel_path).with_suffix('.jpg'))
+        return (out_img_path, new_rel_path)
+    except Exception:
+        return (img_path, rel_path)
+
+
+def execute_pipeline(archive_path, resized_dir, anim_dir, media_dir, original_files_dir, temp_target_dir, tier_tag, worker_id, status_dict):
     stem_name = archive_path.stem
 
     def update_extract_progress(ratio: float, elapsed: float):
@@ -692,24 +741,47 @@ def execute_pipeline(archive_path, resized_dir, anim_dir, media_dir, processed_d
         if not static_images and not animated_images and not media_files:
             return False, "NO_VALID_FILES", 0
 
+        # ========== 動態微批次自適應並行轉檔 (隨時吸收剛釋放的空閒核心) ==========
         total_imgs = len(static_images)
         processed_images = []
-        for idx, (img_path, rel_path) in enumerate(static_images):
-            pct = 0.25 + (0.65 * ((idx + 1) / max(1, total_imgs)))
+
+        tasks = [
+            (idx, img_path, rel_path, processed_dir_tmp / f"img_{idx:05d}.jpg")
+            for idx, (img_path, rel_path) in enumerate(static_images)
+        ]
+
+        CHUNK_SIZE = 24  # 每 24 張圖為一個調度週期
+        max_system_cores = min(12, os.cpu_count() or 4)
+
+        for chunk_start in range(0, total_imgs, CHUNK_SIZE):
+            chunk_tasks = tasks[chunk_start:chunk_start + CHUNK_SIZE]
+
+            idle_count = sum(
+                1 for wid, info in status_dict.items()
+                if "閒置" in info.get("stage", "") and wid != worker_id
+            )
+
+            current_concurrency = min(max(1, idle_count + 1), max_system_cores)
+            stage_desc = f"[magenta]影像轉檔({current_concurrency}T)[/magenta]" if current_concurrency > 1 else "[magenta]影像轉檔[/magenta]"
+
+            if current_concurrency > 1:
+                with ThreadPoolExecutor(max_workers=current_concurrency) as chunk_pool:
+                    chunk_results = list(chunk_pool.map(_process_single_page_task, chunk_tasks))
+            else:
+                chunk_results = [_process_single_page_task(t) for t in chunk_tasks]
+
+            processed_images.extend(chunk_results)
+
+            done_count = len(processed_images)
+            pct = 0.25 + (0.65 * (done_count / max(1, total_imgs)))
             status_dict[worker_id] = {
                 "tier": tier_tag,
-                "stage": "[magenta]影像轉檔[/magenta]",
+                "stage": stage_desc,
                 "name": archive_path.name,
                 "progress": pct,
-                "detail": f"{idx+1}/{total_imgs} 頁"
+                "detail": f"{done_count}/{total_imgs} 頁"
             }
-            new_rel_path = str(Path(rel_path).with_suffix('.jpg'))
-            out_img_path = processed_dir_tmp / f"img_{idx:05d}.jpg"
-            try:
-                resize_and_convert_image(img_path, out_img_path)
-                processed_images.append((out_img_path, new_rel_path))
-            except Exception:
-                processed_images.append((img_path, rel_path))
+        # ========================================================================
 
         status_dict[worker_id] = {
             "tier": tier_tag,
@@ -718,12 +790,23 @@ def execute_pipeline(archive_path, resized_dir, anim_dir, media_dir, processed_d
             "progress": 0.95,
             "detail": "STORE 寫入"
         }
+        # 漫畫維持根目錄直接存放圖片，方便閱讀器瀏覽
         if processed_images:
             create_zip_store(resized_dir / f"{stem_name}{ARCHIVE_MAIN_EXT}", processed_images)
+
+        # 動態圖片與媒體檔案強制在內部包裹一層同名根目錄，確保解壓縮時必定產生同名資料夾
         if animated_images:
-            create_zip_store(anim_dir / f"{stem_name}-Animated{ARCHIVE_OTHER_EXT}", animated_images)
+            create_zip_store(
+                anim_dir / f"{stem_name}-Animated{ARCHIVE_OTHER_EXT}",
+                animated_images,
+                root_folder_name=f"{stem_name}-Animated"
+            )
         if media_files:
-            create_zip_store(media_dir / f"{stem_name}-Media{ARCHIVE_OTHER_EXT}", media_files)
+            create_zip_store(
+                media_dir / f"{stem_name}-Media{ARCHIVE_OTHER_EXT}",
+                media_files,
+                root_folder_name=f"{stem_name}-Media"
+            )
 
     status_dict[worker_id] = {
         "tier": tier_tag,
@@ -732,7 +815,7 @@ def execute_pipeline(archive_path, resized_dir, anim_dir, media_dir, processed_d
         "progress": 1.0,
         "detail": "搬移原檔"
     }
-    safe_move_file(archive_path, processed_dir)
+    safe_move_file(archive_path, original_files_dir)
     return True, "SUCCESS", len(static_images)
 
 
@@ -743,7 +826,7 @@ def worker_task(
     resized_dir_str: str,
     anim_dir_str: str,
     media_dir_str: str,
-    processed_dir_str: str,
+    original_files_dir_str: str,
     error_dir_str: str,
     file_err_dir_str: str,
     worker_id: int,
@@ -755,7 +838,7 @@ def worker_task(
     resized_dir = Path(resized_dir_str)
     anim_dir = Path(anim_dir_str)
     media_dir = Path(media_dir_str)
-    processed_dir = Path(processed_dir_str)
+    original_files_dir = Path(original_files_dir_str)
     error_dir = Path(error_dir_str)
     file_err_dir = Path(file_err_dir_str)
 
@@ -769,34 +852,35 @@ def worker_task(
         temp_target_dir = None
 
     start_task_time = time.time()
+    clean_name = sanitize_log_text(archive_path.name)
     try:
         ok, reason, img_count = execute_pipeline(
-            archive_path, resized_dir, anim_dir, media_dir, processed_dir,
+            archive_path, resized_dir, anim_dir, media_dir, original_files_dir,
             temp_target_dir, tier_tag, worker_id, status_dict
         )
 
         if not ok and reason == "NO_SPACE" and temp_target_dir is not None:
-            recent_logs.append(f"[bold yellow]⚠️ RAM Disk 突發空間不足，轉用 SSD: [/bold yellow]{archive_path.name}")
+            recent_logs.append(("WARN", clean_name, "RAM轉SSD"))
             tier_tag = "[yellow]SSD-重試[/yellow]"
             ok, reason, img_count = execute_pipeline(
-                archive_path, resized_dir, anim_dir, media_dir, processed_dir,
+                archive_path, resized_dir, anim_dir, media_dir, original_files_dir,
                 None, tier_tag, worker_id, status_dict
             )
             if not ok:
                 safe_move_file(archive_path, error_dir)
-                recent_logs.append(f"[bold red]❌ SSD 重試亦失敗 (已移至 Error): [/bold red]{archive_path.name}")
+                recent_logs.append(("SYS_ERR", clean_name, "重試失敗"))
                 status_dict[worker_id] = {"tier": tier_tag, "stage": "閒置", "name": "-", "progress": 0.0, "detail": ""}
                 return archive_path_str, "ERROR", 0
 
         elif not ok and reason in ("CORRUPTED", "NO_VALID_FILES"):
             safe_move_file(archive_path, file_err_dir)
-            recent_logs.append(f"[bold red]❌ 檔案損毀/無法解壓 (已移至 FileErr): [/bold red]{archive_path.name}")
+            recent_logs.append(("FILE_ERR", clean_name, "損毀壞檔"))
             status_dict[worker_id] = {"tier": tier_tag, "stage": "閒置", "name": "-", "progress": 0.0, "detail": ""}
             return archive_path_str, "FILE_ERR", 0
 
         elif not ok:
             safe_move_file(archive_path, error_dir)
-            recent_logs.append(f"[bold red]❌ 執行異常 (已移至 Error): [/bold red]{archive_path.name}")
+            recent_logs.append(("SYS_ERR", clean_name, "執行異常"))
             status_dict[worker_id] = {"tier": tier_tag, "stage": "閒置", "name": "-", "progress": 0.0, "detail": ""}
             return archive_path_str, "ERROR", 0
 
@@ -806,12 +890,12 @@ def worker_task(
                 current_allocated_ram.value = max(0.0, current_allocated_ram.value - reserved_mb)
 
     total_cost = time.time() - start_task_time
-    recent_logs.append(f"[bold green]✔ 完成[/bold green] {archive_path.name} [dim]({total_cost:.1f}s, {img_count}P)[/dim]")
+    recent_logs.append(("OK", clean_name, f"{total_cost:.1f}s, {img_count}P"))
     status_dict[worker_id] = {"tier": tier_tag, "stage": "閒置", "name": "-", "progress": 0.0, "detail": "等待指派"}
     return archive_path_str, "SUCCESS", total_cost
 
 
-def create_mini_bar(pct: float, width=12) -> str:
+def create_mini_bar(pct: float, width=8) -> str:
     pct = max(0.0, min(1.0, pct))
     filled = int(width * pct)
     empty = width - filled
@@ -820,13 +904,14 @@ def create_mini_bar(pct: float, width=12) -> str:
 
 
 def build_enhanced_dashboard(progress, worker_statuses, recent_logs, num_workers, ram_active: bool, ram_disk_gb: int, strict_ram_mode: bool):
+    # 1. 核心工作泳道表格配置
     worker_table = Table(box=box.SIMPLE, expand=True, pad_edge=False, show_header=True)
-    worker_table.add_column("核心", style="bold cyan", width=7, justify="center")
-    worker_table.add_column("層級", width=10, justify="center")
+    worker_table.add_column("核心", style="bold cyan", width=5, justify="center")
+    worker_table.add_column("層級", width=9, justify="center")
     worker_table.add_column("狀態", width=12, justify="center")
-    worker_table.add_column("進度", width=18)
-    worker_table.add_column("檔案名稱", style="white", ratio=1)
-    worker_table.add_column("細節", style="dim", width=14, justify="right")
+    worker_table.add_column("進度", width=14)
+    worker_table.add_column("檔案名稱", style="white", ratio=1, no_wrap=True, overflow="ellipsis")
+    worker_table.add_column("細節", style="dim", width=11, justify="right", no_wrap=True)
 
     for wid in range(num_workers):
         info = worker_statuses.get(wid, {
@@ -836,42 +921,59 @@ def build_enhanced_dashboard(progress, worker_statuses, recent_logs, num_workers
             "progress": 0.0,
             "detail": ""
         })
-        short_name = info.get("name", "-")
-        if len(short_name) > 36:
-            short_name = short_name[:16] + "..." + short_name[-17:]
+        
+        raw_name = sanitize_log_text(info.get("name", "-"))
+        display_name = raw_name if raw_name != "-" else "[dim]-[/dim]"
 
         stage_str = info.get("stage", "準備")
         stage_display = stage_str if "閒置" not in stage_str else "[dim]閒置[/dim]"
 
         worker_table.add_row(
-            f"Core {wid+1:02d}",
+            f"C{wid+1:02d}",
             info.get("tier", "-"),
             stage_display,
-            create_mini_bar(info.get("progress", 0.0)),
-            short_name,
+            create_mini_bar(info.get("progress", 0.0), width=8),
+            display_name,
             info.get("detail", "")
         )
 
-    logs_table = Table(box=box.SIMPLE, expand=True, show_header=False)
-    logs_table.add_column("Log", ratio=1)
-    display_logs = list(recent_logs)[-6:]
+    # 2. 近期動態表格配置（結構化三欄：狀態 / 彈性檔名 / 優先靠右數據）[cite: 7]
+    logs_table = Table(box=box.SIMPLE, expand=True, show_header=False, pad_edge=False)
+    logs_table.add_column("狀態", width=10, justify="center", no_wrap=True)
+    logs_table.add_column("檔案名稱", ratio=1, no_wrap=True, overflow="ellipsis")
+    logs_table.add_column("數據", width=16, justify="right", style="dim", no_wrap=True)
+    
+    log_display_lines = max(6, min(num_workers, 14))
+    display_logs = list(recent_logs)[-log_display_lines:]
+    
     if not display_logs:
-        logs_table.add_row("[dim]尚無處理完成紀錄...[/dim]")
+        logs_table.add_row("", "[dim]尚無處理紀錄...[/dim]", "")
     else:
-        for log in display_logs:
-            logs_table.add_row(log)
+        for item in display_logs:
+            if isinstance(item, (tuple, list)) and len(item) == 3:
+                tag, name, stat = item
+                if tag == "OK":
+                    status_cell = "[bold green][OK][/bold green]"
+                elif tag == "FILE_ERR":
+                    status_cell = "[bold red][壞檔][/bold red]"
+                elif tag == "SYS_ERR":
+                    status_cell = "[bold red][異常][/bold red]"
+                else:
+                    status_cell = "[bold yellow][注意][/bold yellow]"
+                logs_table.add_row(status_cell, name, f"({stat})")
+            else:
+                logs_table.add_row("[dim]::[/dim]", str(item), "")
 
     ram_usage_text, ram_pct = get_ram_disk_usage()
     ram_style = "bold red" if ram_pct > 85 else ("bold yellow" if ram_pct > 60 else "bold green")
     mode_text = "[bold green]RAM 獨占[/bold green]" if strict_ram_mode else "[yellow]RAM 彈性[/yellow]"
 
-    # 使用 Text.from_markup() 確保標籤正確解析為終端機色彩
     header_markup = (
-        f"  [dim]⚡ 核心:[/dim] [bold cyan]{num_workers}C[/bold cyan]  "
-        f"│  [dim]💾 RAM Disk:[/dim] [{ram_style}]{ram_disk_gb}GB ({ram_usage_text})[/{ram_style}]  "
-        f"│  [dim]🎯 策略:[/dim] {mode_text}  "
-        f"│  [dim]⌨️  熱鍵:[/dim] [bold red]qqq 中止[/bold red]  "
-        f"│  [dim]⚙️ 引擎:[/dim] [bold magenta]{SEVEN_ZIP_BIN} STORE[/bold magenta]"
+        f"  [dim]:: CPU:[/dim] [bold cyan]{num_workers}C[/bold cyan]  "
+        f"|  [dim]:: RAM:[/dim] [{ram_style}]{ram_disk_gb}GB ({ram_usage_text})[/{ram_style}]  "
+        f"|  [dim]:: MODE:[/dim] {mode_text}  "
+        f"|  [dim]:: ABORT:[/dim] [bold red]qqq[/bold red]  "
+        f"|  [dim]:: ENGINE:[/dim] [bold magenta]{SEVEN_ZIP_BIN} STORE[/bold magenta]"
     )
     header_info = Text.from_markup(header_markup)
 
@@ -881,25 +983,26 @@ def build_enhanced_dashboard(progress, worker_statuses, recent_logs, num_workers
         Layout(Panel(progress, title="[bold cyan]總體任務進度[/bold cyan]", border_style="cyan"), size=4),
         Layout(name="body")
     )
+    
     layout["body"].split_row(
-        Layout(Panel(worker_table, title="[bold green]核心工作泳道[/bold green]", border_style="green"), ratio=7),
-        Layout(Panel(logs_table, title="[bold white]近期動態[/bold white]", border_style="blue"), ratio=3)
+        Layout(Panel(worker_table, title="[bold green]核心工作泳道[/bold green]", border_style="green"), ratio=52),
+        Layout(Panel(logs_table, title="[bold white]近期動態[/bold white]", border_style="blue"), ratio=48)
     )
     return layout
 
 
 def print_summary_card(
     console, total_time_sec, total_count, success_count, fail_err_count, corrupted_count,
-    resized_dir, anim_dir, media_dir, processed_dir, error_dir, file_err_dir, file_err_stems, aborted=False
+    resized_dir, anim_dir, media_dir, original_files_dir, error_dir, file_err_dir, file_err_stems, aborted=False
 ):
-    processed_bytes = get_dir_size_bytes(processed_dir)
+    original_bytes = get_dir_size_bytes(original_files_dir)
     resized_bytes = get_dir_size_bytes(resized_dir)
     anim_bytes = get_dir_size_bytes(anim_dir)
     media_bytes = get_dir_size_bytes(media_dir)
 
     output_total_bytes = resized_bytes + anim_bytes + media_bytes
-    saved_bytes = processed_bytes - output_total_bytes
-    pct_saved = (saved_bytes / processed_bytes * 100) if processed_bytes > 0 else 0.0
+    saved_bytes = original_bytes - output_total_bytes
+    pct_saved = (saved_bytes / original_bytes * 100) if original_bytes > 0 else 0.0
 
     hrs, rem = divmod(int(total_time_sec), 3600)
     mins, secs = divmod(rem, 60)
@@ -909,13 +1012,13 @@ def print_summary_card(
 
     summary_text = Text()
     if aborted:
-        summary_text.append("⚠️  使用者已連續輸入 [qqq] 手動中止作業！已保存完成之進度。\n\n", style="bold red")
+        summary_text.append("[!] 使用者已連續輸入 [qqq] 中止作業，已妥善保存目前進度。\n\n", style="bold red")
 
-    summary_text.append(f"⏱️  總執行耗時: ", style="bold white")
-    summary_text.append(f"{time_str}", style="bold cyan")
+    summary_text.append(">> 執行耗時 : ", style="bold cyan")
+    summary_text.append(f"{time_str}", style="bold white")
     summary_text.append(f" (平均 {avg_per_file:.1f} 秒/檔案)\n", style="dim")
 
-    summary_text.append(f"📊 檔案結算: ", style="bold white")
+    summary_text.append(">> 檔案結算 : ", style="bold cyan")
     summary_text.append(f"共掃描 {total_count} 個 / 已處置 {done_count} 個", style="bold white")
     summary_text.append(f" (成功: ", style="dim")
     summary_text.append(f"{success_count}", style="bold green")
@@ -923,33 +1026,41 @@ def print_summary_card(
     summary_text.append(f"{corrupted_count}", style="bold red" if corrupted_count > 0 else "dim")
     summary_text.append(f", 異常: ", style="dim")
     summary_text.append(f"{fail_err_count}", style="bold yellow" if fail_err_count > 0 else "dim")
-    summary_text.append(f")\n\n", style="dim")
+    summary_text.append(")\n\n", style="dim")
 
-    summary_text.append(f"💾 空間節省統計:\n", style="bold yellow")
-    summary_text.append(f"   • 已歸檔原檔體積 (Processed) : {format_bytes(processed_bytes)}\n", style="white")
-    summary_text.append(f"   • 最佳化成品體積 (Resized+其他): {format_bytes(output_total_bytes)}\n", style="white")
+    summary_text.append(">> 空間節省統計:\n", style="bold yellow")
+    summary_text.append(f"   * 已歸檔原檔體積 (OriginalFiles) : {format_bytes(original_bytes)}\n", style="white")
+    summary_text.append(f"   * 最佳化成品體積 (Resized+其他)  : {format_bytes(output_total_bytes)}\n", style="white")
     if saved_bytes > 0:
-        summary_text.append(f"   • 空間縮減 (節省容量)         : ", style="white")
+        summary_text.append(f"   * 空間縮減 (節省容量)          : ", style="white")
         summary_text.append(f"{format_bytes(saved_bytes)} (▼ {pct_saved:.1f}%)\n", style="bold green")
     else:
-        summary_text.append(f"   • 空間變化                    : 原圖尺寸較小或已為高度壓縮檔\n", style="dim")
+        summary_text.append(f"   * 空間變化                     : 原圖尺寸較小或已為高度壓縮檔\n", style="dim")
 
-    summary_text.append(f"\n📂 目錄產出狀態:\n", style="bold cyan")
+    summary_text.append("\n>> 目錄產出狀態:\n", style="bold magenta")
     if resized_dir.exists():
-        summary_text.append(f"   • 📖 漫畫書庫 : {resized_dir} ({format_bytes(resized_bytes)})\n", style="white")
+        summary_text.append(f"   * 漫畫書庫 : {resized_dir} ({format_bytes(resized_bytes)})\n", style="white")
     if anim_dir.exists():
-        summary_text.append(f"   • 🎬 動態圖片 : {anim_dir} ({format_bytes(anim_bytes)})\n", style="white")
+        summary_text.append(f"   * 動態圖片 : {anim_dir} ({format_bytes(anim_bytes)})\n", style="white")
     if media_dir.exists():
-        summary_text.append(f"   • 🎵 影音檔案 : {media_dir} ({format_bytes(media_bytes)})\n", style="white")
-    if processed_dir.exists():
-        summary_text.append(f"   • 📦 原檔歸檔 : {processed_dir} ({format_bytes(processed_bytes)})\n", style="white")
+        summary_text.append(f"   * 影音檔案 : {media_dir} ({format_bytes(media_bytes)})\n", style="white")
+    if original_files_dir.exists():
+        summary_text.append(f"   * 原檔歸檔 : {original_files_dir} ({format_bytes(original_bytes)})\n", style="white")
     
-    # 輸出 FileErr 純檔名清單檔及 E-Hentai 搜尋導航 HTML[cite: 1]
-    if file_err_dir.exists() and corrupted_count > 0:
+    # 輸出 FileErr 純檔名清單檔及 E-Hentai 搜尋導航 HTML (智慧合併當日歷史，避免同日多輪被覆蓋)
+    if file_err_dir.exists() and (corrupted_count > 0 or (file_err_dir / "corrupted_list.txt").exists()):
         list_file = file_err_dir / "corrupted_list.txt"
         html_file = file_err_dir / "corrupted_search.html"
         try:
-            sorted_stems = sorted(list(set(file_err_stems)), key=natural_sort_key)
+            existing_stems = set()
+            if list_file.exists():
+                for line in list_file.read_text(encoding="utf-8").splitlines():
+                    clean_line = line.strip()
+                    if clean_line:
+                        existing_stems.add(clean_line)
+
+            all_stems = existing_stems.union(set(file_err_stems))
+            sorted_stems = sorted(list(all_stems), key=natural_sort_key)
             list_file.write_text("\n".join(sorted_stems), encoding="utf-8")
 
             records = []
@@ -963,25 +1074,30 @@ def print_summary_card(
             if records:
                 generate_eh_search_html(records, html_file)
 
-            summary_text.append(f"   • 🛑 損毀檔案 : {file_err_dir} ({corrupted_count} 個損毀檔)\n", style="bold red")
-            summary_text.append(f"     ├─ 📑 清單已儲存至: {list_file.name} (無副檔名)\n", style="dim")
-            summary_text.append(f"     └─ 🌐 導航已儲存至: {html_file.name} (E-Hentai 搜尋導航表)\n", style="bold magenta")
+            total_bad = len(sorted_stems)
+            summary_text.append(f"   * 損毀檔案 : {file_err_dir} (本次新增: {corrupted_count} 個 / 當日累計: {total_bad} 個)\n", style="bold red")
+            summary_text.append(f"     |- 清單已更新至: {list_file.name} (無副檔名)\n", style="dim")
+            summary_text.append(f"     |- 導航已更新至: {html_file.name} (E-Hentai 搜尋導航表)\n", style="bold cyan")
         except Exception:
-            summary_text.append(f"   • 🛑 損毀檔案 : {file_err_dir} ({corrupted_count} 個損毀檔)\n", style="bold red")
+            summary_text.append(f"   * 損毀檔案 : {file_err_dir} ({corrupted_count} 個損毀檔)\n", style="bold red")
 
     if error_dir.exists() and fail_err_count > 0:
-        summary_text.append(f"   • ⚠️ 執行異常 : {error_dir} ({fail_err_count} 個檔案)\n", style="bold yellow")
+        summary_text.append(f"   * 執行異常 : {error_dir} ({fail_err_count} 個檔案)\n", style="bold yellow")
 
-    card_title = "[bold red]🛑 任務中止結算報告 (Aborted)[/bold red]" if aborted else "[bold green]🎉 處理成果結算報告 (Summary Report)[/bold green]"
+    card_title = "[bold red][ ABORTED ] 任務中止結算報告[/bold red]" if aborted else "[bold green][ COMPLETE ] 處理成果結算報告[/bold green]"
     border_style = "red" if aborted else "green"
     console.print(Panel(summary_text, title=card_title, border_style=border_style, expand=False))
 
 
-def is_system_generated_path(path: Path) -> bool:
-    """檢查路徑中的任何層級是否符合本工具產出的目錄前綴"""
-    for part in path.parts:
-        if part.startswith(SYSTEM_DIR_PREFIXES):
-            return True
+def is_system_generated_path(path: Path, source_dir: Path) -> bool:
+    """檢查路徑相對於 source_dir 的子目錄是否符合產出目錄前綴（不檢查父層及自身根路徑）"""
+    try:
+        rel_parts = path.relative_to(source_dir).parts
+        for part in rel_parts[:-1]:
+            if part.startswith(SYSTEM_DIR_PREFIXES):
+                return True
+    except Exception:
+        pass
     return False
 
 
@@ -995,24 +1111,23 @@ def main():
 
     source_dir = Path(src_folder).expanduser().resolve()
     if not source_dir.is_dir():
-        console.print(f"[bold red]❌ 錯誤：路徑不存在：{source_dir}[/bold red]")
+        console.print(f"[bold red][ERR] 路徑不存在：{source_dir}[/bold red]")
         sys.exit(1)
 
     today_str = datetime.now().strftime("%Y-%m-%d")
     resized_dir = source_dir / f"Resized-{today_str}"
     anim_dir = source_dir / f"Animated-{today_str}"
     media_dir = source_dir / f"Media-{today_str}"
-    processed_dir = source_dir / f"Processed-{today_str}"
+    original_files_dir = source_dir / f"OriginalFiles-{today_str}"
     error_dir = source_dir / f"Error-{today_str}"
     file_err_dir = source_dir / f"FileErr-{today_str}"
 
-    # 全面過濾本工具過去產生的所有歷史資料夾
     archive_files = [
         p for p in source_dir.rglob("*")
         if p.is_file() 
         and p.suffix.lower() in ARCHIVE_EXTENSIONS 
         and not p.name.startswith("._")
-        and not is_system_generated_path(p)
+        and not is_system_generated_path(p, source_dir)
     ]
 
     if not archive_files:
@@ -1047,17 +1162,17 @@ def main():
         else:
             strict_ram_mode = False
 
-        console.print(f"[cyan]🔍 正在初始化 {ram_disk_gb} GB RAM Disk 環境...[/cyan]")
+        console.print(f"[cyan]正在初始化 {ram_disk_gb} GB RAM Disk 環境...[/cyan]")
         ram_path = setup_ram_disk(ram_disk_gb)
         ram_active = ram_path is not None
         if ram_active:
             mode_desc = "純 RAM 獨占排程 (保護 SSD)" if strict_ram_mode else "RAM 彈性排程 (超限走 SSD)"
-            console.print(f"[bold green]✔ 已成功配置 {ram_disk_gb} GB RAM Disk！模式: {mode_desc}[/bold green]")
+            console.print(f"[bold green][OK] 已成功配置 {ram_disk_gb} GB RAM Disk！模式: {mode_desc}[/bold green]")
         else:
-            console.print("[yellow]⚠ RAM Disk 建立失敗，將直接使用系統 SSD 進行暫存。[/yellow]")
+            console.print("[yellow][WARN] RAM Disk 建立失敗，將直接使用系統 SSD 進行暫存。[/yellow]")
     else:
         ram_active = False
-        console.print("[yellow]⚡ 已設定為 0 GB，本次作業將全面走本機 SSD 執行。[/yellow]")
+        console.print("[yellow]已設定為 0 GB，本次作業將全面走本機 SSD 執行。[/yellow]")
 
     # 2. 空間記帳員狀態
     manager = multiprocessing.Manager()
@@ -1072,16 +1187,16 @@ def main():
     ram_lock = manager.Lock()
     ram_manager_tuple = (current_allocated_ram, ram_budget_mb, ram_lock)
 
-    # 3. 多執行緒平行前置預檢 (搭配即時動態進度條)
+    # 3. 極速前置預檢 (搭配即時動態進度條)
     pending_queue = []
     max_inspect_threads = min(32, (os.cpu_count() or 4) * 4)
 
     with Progress(
         SpinnerColumn(),
-        TextColumn("[bold cyan]📑 檔案展開尺寸預檢[/bold cyan]"),
+        TextColumn("[bold cyan]:: 檔案展開尺寸預檢[/bold cyan]"),
         BarColumn(bar_width=None),
         MofNCompleteColumn(),
-        TextColumn("•"),
+        TextColumn("-"),
         TimeRemainingColumn(),
         TextColumn("[dim]{task.fields[current_file]}[/dim]"),
         console=console
@@ -1098,27 +1213,28 @@ def main():
             
             for future in as_completed(future_to_arch):
                 arch = future_to_arch[future]
-                short_name = arch.name if len(arch.name) <= 28 else arch.name[:12] + "..." + arch.name[-13:]
+                clean_inspect_name = sanitize_log_text(arch.name)
+                short_name = clean_inspect_name if len(clean_inspect_name) <= 28 else clean_inspect_name[:12] + "..." + clean_inspect_name[-13:]
                 try:
                     res = future.result()
                     pending_queue.append(res)
                 except Exception:
                     pending_queue.append({
                         "path": arch,
-                        "uncompressed_mb": arch.stat().st_size * 2.0 / (1024 * 1024),
+                        "uncompressed_mb": (arch.stat().st_size * 1.2) / (1024 * 1024),
                         "retries": 0
                     })
                 inspect_progress.update(inspect_task, advance=1, current_file=short_name)
 
     pending_queue.sort(key=lambda x: x["uncompressed_mb"], reverse=True)
-    console.print("[bold green]✔ 檔案尺寸預檢完成！[/bold green]\n")
+    console.print("[bold green][OK] 檔案尺寸預檢完成！[/bold green]\n")
 
     progress = Progress(
         SpinnerColumn(),
         TextColumn("[progress.description]{task.description}"),
         BarColumn(bar_width=None),
         MofNCompleteColumn(),
-        TextColumn("•"),
+        TextColumn("-"),
         TimeRemainingColumn(),
     )
     task_id = progress.add_task("壓縮檔排程 (隨時輸入 qqq 中止)...", total=len(archive_files))
@@ -1145,7 +1261,7 @@ def main():
                 while (pending_queue or active_futures) and not was_aborted:
                     if abort_listener.aborted:
                         was_aborted = True
-                        recent_logs.append("[bold red]🛑 接收到 qqq 指令，停止所有工作核心...[/bold red]")
+                        recent_logs.append(("SYS_ERR", "使用者連續輸入 qqq", "停止核心"))
                         for p in executor._processes.values():
                             try:
                                 p.terminate()
@@ -1223,7 +1339,7 @@ def main():
                                 str(resized_dir),
                                 str(anim_dir),
                                 str(media_dir),
-                                str(processed_dir),
+                                str(original_files_dir),
                                 str(error_dir),
                                 str(file_err_dir),
                                 worker_id,
@@ -1243,7 +1359,7 @@ def main():
     finally:
         abort_listener.stop()
         if ram_active:
-            console.print("\n[cyan]🧹 正在安全卸載 RAM Disk...[/cyan]")
+            console.print("\n[cyan]正在安全卸載 RAM Disk...[/cyan]")
             cleanup_ram_disk()
 
     global_cost = time.time() - global_start_time
@@ -1258,7 +1374,7 @@ def main():
         resized_dir,
         anim_dir,
         media_dir,
-        processed_dir,
+        original_files_dir,
         error_dir,
         file_err_dir,
         file_err_stems,
