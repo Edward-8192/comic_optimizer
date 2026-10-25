@@ -29,15 +29,167 @@ from PyQt6.QtWidgets import (
     QLabel, QLineEdit, QPushButton, QFileDialog, QSpinBox, QCheckBox,
     QProgressBar, QTableWidget, QTableWidgetItem, QHeaderView,
     QSplitter, QMessageBox, QFrame, QAbstractItemView, QTabWidget,
-    QListWidget, QListWidgetItem
+    QListWidget, QListWidgetItem, QComboBox
 )
-from PyQt6.QtGui import QDragEnterEvent, QDropEvent, QColor, QCloseEvent
+from PyQt6.QtGui import QDragEnterEvent, QDropEvent, QColor, QCloseEvent, QPainter, QFont
 
 # ==================== Core Configuration ====================
 MAX_WIDTH = 3840
 MAX_HEIGHT = 2160
 JPEG_QUALITY = 85
-MAX_RAM_RETRIES = 5
+
+RESOLUTION_PRESETS = [
+    ("4K UHD (3840×2160)", 3840, 2160),
+    ("QHD 2K (2560×1440)", 2560, 1440),
+    ("FHD 1080p (1920×1080)", 1920, 1080),
+    ("Tablet HD (1600×1200)", 1600, 1200),
+    ("Original Resolution (No Resize)", 0, 0),
+]
+
+MODERN_DARK_STYLESHEET = """
+QMainWindow, QWidget {
+    background-color: #0f172a;
+    color: #e2e8f0;
+    font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Helvetica Neue", sans-serif;
+    font-size: 13px;
+}
+QTabWidget::pane {
+    border: 1px solid #334155;
+    border-radius: 8px;
+    background-color: #1e293b;
+    top: -1px;
+}
+QTabBar::tab {
+    background-color: #0f172a;
+    color: #94a3b8;
+    border: 1px solid #334155;
+    border-bottom: none;
+    border-top-left-radius: 6px;
+    border-top-right-radius: 6px;
+    padding: 8px 18px;
+    margin-right: 4px;
+    font-weight: 600;
+}
+QTabBar::tab:selected {
+    background-color: #1e293b;
+    color: #38bdf8;
+    border-bottom: 2px solid #38bdf8;
+}
+QTabBar::tab:hover:!selected {
+    background-color: #1e293b;
+    color: #cbd5e1;
+}
+QLineEdit, QSpinBox, QComboBox {
+    background-color: #0f172a;
+    border: 1px solid #334155;
+    border-radius: 6px;
+    padding: 6px 10px;
+    color: #f8fafc;
+    selection-background-color: #0284c7;
+}
+QLineEdit:focus, QSpinBox:focus, QComboBox:focus {
+    border: 1px solid #38bdf8;
+}
+QComboBox::drop-down {
+    border: none;
+    padding-right: 8px;
+}
+QListWidget {
+    background-color: #0f172a;
+    border: 1px solid #334155;
+    border-radius: 6px;
+    padding: 4px;
+    color: #f1f5f9;
+}
+QListWidget::item {
+    padding: 5px 8px;
+    border-radius: 4px;
+}
+QListWidget::item:selected {
+    background-color: #0369a1;
+    color: #ffffff;
+}
+QListWidget::item:hover:!selected {
+    background-color: #1e293b;
+}
+QPushButton {
+    background-color: #334155;
+    color: #f1f5f9;
+    border: 1px solid #475569;
+    border-radius: 6px;
+    padding: 6px 14px;
+    font-weight: 600;
+}
+QPushButton:hover {
+    background-color: #475569;
+    border-color: #64748b;
+}
+QPushButton:pressed {
+    background-color: #1e293b;
+}
+QPushButton:disabled {
+    background-color: #1e293b;
+    color: #475569;
+    border-color: #334155;
+}
+QTableWidget {
+    background-color: #0f172a;
+    alternate-background-color: #131c31;
+    border: 1px solid #334155;
+    border-radius: 6px;
+    gridline-color: #1e293b;
+    color: #e2e8f0;
+    selection-background-color: #0c4a6e;
+    selection-color: #f8fafc;
+}
+QHeaderView::section {
+    background-color: #1e293b;
+    color: #94a3b8;
+    font-weight: 700;
+    font-size: 12px;
+    padding: 6px 8px;
+    border: none;
+    border-bottom: 1px solid #334155;
+    border-right: 1px solid #1e293b;
+}
+QProgressBar {
+    background-color: #1e293b;
+    border: 1px solid #334155;
+    border-radius: 6px;
+    text-align: center;
+    color: #f8fafc;
+    font-weight: bold;
+    min-height: 20px;
+}
+QProgressBar::chunk {
+    background-color: #0284c7;
+    border-radius: 5px;
+}
+QCheckBox {
+    spacing: 6px;
+    color: #cbd5e1;
+    font-weight: 500;
+}
+QSplitter::handle {
+    background-color: #334155;
+    width: 2px;
+}
+"""
+
+def reveal_in_finder(target_path: Path):
+    if not target_path:
+        return
+    try:
+        if target_path.exists():
+            if target_path.is_file():
+                subprocess.Popen(["open", "-R", str(target_path)])
+            else:
+                subprocess.Popen(["open", str(target_path)])
+        elif target_path.parent.exists():
+            subprocess.Popen(["open", str(target_path.parent)])
+    except Exception:
+        pass
+MAX_RAM_RETRIES = 150
 RAM_DISK_MOUNT = Path("/Volumes/ComicRamDisk")
 
 ARCHIVE_EXTENSIONS = {'.zip', '.rar', '.7z', '.cbz', '.cbr'}
@@ -68,6 +220,9 @@ def get_app_support_dir() -> Path:
     primary = Path.home() / "Library" / "Application Support" / "ComicOptimizer"
     try:
         primary.mkdir(parents=True, exist_ok=True)
+        test_file = primary / ".write_probe"
+        test_file.touch(exist_ok=True)
+        test_file.unlink(missing_ok=True)
         return primary
     except OSError:
         fallback = Path(tempfile.gettempdir()) / "ComicOptimizer"
@@ -232,6 +387,7 @@ def find_7z_binary() -> str:
 SEVEN_ZIP_BIN = find_7z_binary()
 
 def sanitize_log_text(text: str) -> str:
+    # 僅濾除高位元面補充區的彩色 Emoji，完整保留中日韓漢字 (CJK)、假名與全形標點符號
     emoji_pattern = re.compile(
         "["
         "\U0001F1E0-\U0001F1FF"
@@ -244,8 +400,6 @@ def sanitize_log_text(text: str) -> str:
         "\U0001F900-\U0001F9FF"
         "\U0001FA00-\U0001FA6F"
         "\U0001FA70-\U0001FAFF"
-        "\U00002702-\U000027B0"
-        "\U000024C2-\U0001F251" 
         "]+", flags=re.UNICODE
     )
     return emoji_pattern.sub("", text)
@@ -354,17 +508,26 @@ def get_ram_disk_usage():
     except Exception:
         return "Unknown", 0.0
 
+def get_ram_disk_free_mb() -> float:
+    if not RAM_DISK_MOUNT.exists():
+        return 0.0
+    try:
+        return shutil.disk_usage(RAM_DISK_MOUNT).free / (1024 * 1024)
+    except Exception:
+        return 0.0
+
 def get_uncompressed_size_mb_fast(archive_path: Path) -> float:
     ext = archive_path.suffix.lower()
     try:
         if ext in ('.zip', '.cbz'):
             with zipfile.ZipFile(archive_path, 'r') as zf:
                 total_bytes = sum(zinfo.file_size for zinfo in zf.infolist())
-                return total_bytes / (1024 * 1024)
+                # 預留 8% 檔案系統區塊與暫存緩衝
+                return (total_bytes * 1.08) / (1024 * 1024)
         else:
-            return (archive_path.stat().st_size * 1.2) / (1024 * 1024)
+            return (archive_path.stat().st_size * 1.30) / (1024 * 1024)
     except Exception:
-        return (archive_path.stat().st_size * 1.2) / (1024 * 1024)
+        return (archive_path.stat().st_size * 1.30) / (1024 * 1024)
 
 def inspect_archive_worker(item_dict: dict):
     arch = item_dict["path"]
@@ -372,7 +535,9 @@ def inspect_archive_worker(item_dict: dict):
         "path": arch,
         "src_root": item_dict["src_root"],
         "uncompressed_mb": get_uncompressed_size_mb_fast(arch),
-        "retries": 0
+        "retries": 0,
+        "ram_oom_retries": 0,
+        "force_ssd": False
     }
 
 def natural_sort_key(s):
@@ -387,7 +552,10 @@ def is_image_animated(image_path: Path) -> bool:
         pass
     return False
 
-def resize_and_convert_image(src_path: Path, dst_path: Path):
+def resize_and_convert_image(
+    src_path: Path, dst_path: Path,
+    max_w: int = MAX_WIDTH, max_h: int = MAX_HEIGHT, jpeg_quality: int = JPEG_QUALITY
+):
     with Image.open(src_path) as img:
         img = ImageOps.exif_transpose(img)
         if img.mode in ("RGBA", "LA") or (img.mode == "P" and "transparency" in img.info):
@@ -398,14 +566,15 @@ def resize_and_convert_image(src_path: Path, dst_path: Path):
         elif img.mode != "RGB":
             img = img.convert("RGB")
 
-        orig_w, orig_h = img.size
-        ratio = min(MAX_WIDTH / orig_w, MAX_HEIGHT / orig_h)
-        if ratio < 1.0:
-            new_w = int(orig_w * ratio)
-            new_h = int(orig_h * ratio)
-            img = img.resize((new_w, new_h), Image.Resampling.LANCZOS)
+        if max_w > 0 and max_h > 0:
+            orig_w, orig_h = img.size
+            ratio = min(max_w / orig_w, max_h / orig_h)
+            if ratio < 1.0:
+                new_w = int(orig_w * ratio)
+                new_h = int(orig_h * ratio)
+                img = img.resize((new_w, new_h), Image.Resampling.LANCZOS)
 
-        img.save(dst_path, format="JPEG", quality=JPEG_QUALITY, optimize=True)
+        img.save(dst_path, format="JPEG", quality=jpeg_quality, optimize=True)
 
 def extract_archive_stream(archive_path: Path, extract_dir: Path, progress_callback=None):
     ext = archive_path.suffix.lower()
@@ -460,7 +629,7 @@ def extract_archive_stream(archive_path: Path, extract_dir: Path, progress_callb
         if "No space left on device" in str(e): return False, "NO_SPACE"
         return False, "CORRUPTED"
 
-def create_zip_store(target_archive: Path, file_pairs: list, root_folder_name: str = None):
+def create_zip_store(target_archive: Path, file_pairs: list, root_folder_name: str = None, consume_source: bool = False):
     if not file_pairs: return
     target_archive.parent.mkdir(parents=True, exist_ok=True)
     file_pairs.sort(key=lambda x: natural_sort_key(x[1]))
@@ -482,6 +651,11 @@ def create_zip_store(target_archive: Path, file_pairs: list, root_folder_name: s
         for disk_path, arc_name in file_pairs:
             final_arc_name = f"{root_folder_name}/{arc_name}" if needs_wrapper else arc_name
             zf.write(disk_path, arcname=final_arc_name)
+            if consume_source:
+                try:
+                    Path(disk_path).unlink(missing_ok=True)
+                except Exception:
+                    pass
 
 def safe_move_file(src_path: Path, dst_dir: Path):
     dst_dir.mkdir(parents=True, exist_ok=True)
@@ -518,17 +692,33 @@ def is_system_generated_path(path: Path, source_dir: Path) -> bool:
     return False
 
 def _process_single_page_task(args):
-    idx, img_path, rel_path, out_img_path = args
+    idx, img_path, rel_path, out_img_path, max_w, max_h, jpeg_quality = args
     try:
-        resize_and_convert_image(img_path, out_img_path)
+        resize_and_convert_image(img_path, out_img_path, max_w=max_w, max_h=max_h, jpeg_quality=jpeg_quality)
+        # 邊轉邊刪：轉換成功寫入後，立刻刪除暫存原圖，避免 RAM Disk 空間倍增
+        if out_img_path.exists() and out_img_path.stat().st_size > 0:
+            try:
+                img_path.unlink(missing_ok=True)
+            except Exception:
+                pass
         new_rel_path = str(Path(rel_path).with_suffix('.jpg'))
         return (out_img_path, new_rel_path)
+    except OSError as e:
+        try:
+            out_img_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+        if e.errno == 28 or "No space left on device" in str(e):
+            raise
+        return (img_path, rel_path)
     except Exception:
         return (img_path, rel_path)
 
 def execute_pipeline(
     archive_path, resized_dir, anim_dir, media_dir, original_files_dir,
-    temp_target_dir, tier_tag, worker_id, status_dict, cpu_token_manager
+    temp_target_dir, tier_tag, worker_id, status_dict, cpu_token_manager,
+    max_w: int = MAX_WIDTH, max_h: int = MAX_HEIGHT, jpeg_quality: int = JPEG_QUALITY,
+    io_controller=None
 ):
     stem_name = archive_path.stem
     allocated_tokens, cpu_token_lock = cpu_token_manager
@@ -543,10 +733,35 @@ def execute_pipeline(
         temp_dir = Path(temp_dir_str)
         extracted_dir = temp_dir / "extracted"
         processed_dir_tmp = temp_dir / "processed"
+        staged_out_dir = temp_dir / "staged_out"
         extracted_dir.mkdir(parents=True, exist_ok=True)
         processed_dir_tmp.mkdir(parents=True, exist_ok=True)
+        staged_out_dir.mkdir(parents=True, exist_ok=True)
 
-        success, reason = extract_archive_stream(archive_path, extracted_dir, update_extract_progress)
+        # 階段 1: 透過 Disk I/O 閘門控制併發解壓縮讀取（若有已完成待寫出的任務則優先禮讓）
+        if io_controller is not None:
+            active_io_streams, waiting_writers, io_lock, max_io_streams = io_controller
+            status_dict[worker_id] = {
+                "tier": tier_tag, "stage": "Queued I/O", "name": archive_path.name,
+                "progress": 0.0, "detail": "Waiting Disk"
+            }
+            acquired_read = False
+            try:
+                while True:
+                    with io_lock:
+                        if active_io_streams.value < max_io_streams and waiting_writers.value == 0:
+                            active_io_streams.value += 1
+                            acquired_read = True
+                            break
+                    time.sleep(0.04)
+                success, reason = extract_archive_stream(archive_path, extracted_dir, update_extract_progress)
+            finally:
+                if acquired_read:
+                    with io_lock:
+                        active_io_streams.value = max(0, active_io_streams.value - 1)
+        else:
+            success, reason = extract_archive_stream(archive_path, extracted_dir, update_extract_progress)
+
         if not success:
             return False, reason, 0, 0
 
@@ -577,93 +792,145 @@ def execute_pipeline(
         total_imgs = len(static_images)
         processed_images = []
         tasks = [
-            (idx, img_path, rel_path, processed_dir_tmp / f"img_{idx:05d}.jpg")
+            (idx, img_path, rel_path, processed_dir_tmp / f"img_{idx:05d}.jpg", max_w, max_h, jpeg_quality)
             for idx, (img_path, rel_path) in enumerate(static_images)
         ]
 
         CHUNK_SIZE = 24
-        for chunk_start in range(0, total_imgs, CHUNK_SIZE):
-            chunk_tasks = tasks[chunk_start:chunk_start + CHUNK_SIZE]
+        try:
+            for chunk_start in range(0, total_imgs, CHUNK_SIZE):
+                chunk_tasks = tasks[chunk_start:chunk_start + CHUNK_SIZE]
 
-            borrowed_tokens = 0
-            borrowed_idle_wids = []
-            with cpu_token_lock:
-                idle_wids = [
-                    wid for wid, info in status_dict.items()
-                    if wid != worker_id and info.get("stage", "") == "Idle"
-                ]
-                available_tokens = max(0, len(idle_wids) - allocated_tokens.value)
-                if available_tokens > 0:
-                    desired = min(7, available_tokens)
-                    allocated_tokens.value += desired
-                    borrowed_tokens = desired
-                    borrowed_idle_wids = idle_wids[:desired]
+                borrowed_tokens = 0
+                borrowed_idle_specs = []
+                with cpu_token_lock:
+                    # Idle 或正在排隊等硬碟 I/O (Queued I/O) 的核心皆不耗 CPU，可全數借出協助圖片縮放
+                    idle_candidates = [
+                        (wid, dict(info)) for wid, info in status_dict.items()
+                        if wid != worker_id and info.get("stage", "") in ("Idle", "Queued I/O")
+                    ]
+                    available_tokens = max(0, len(idle_candidates) - allocated_tokens.value)
+                    if available_tokens > 0:
+                        desired = available_tokens
+                        allocated_tokens.value += desired
+                        borrowed_tokens = desired
+                        borrowed_idle_specs = idle_candidates[:desired]
 
-            for b_wid in borrowed_idle_wids:
-                status_dict[b_wid] = {
-                    "tier": "CPU", "stage": "Assisting", "name": f"Borrowed by C{worker_id+1:02d}",
-                    "progress": 0.99, "detail": "Thread"
+                for b_wid, prev_info in borrowed_idle_specs:
+                    status_dict[b_wid] = {
+                        "tier": "CPU", "stage": "Assisting", "name": f"Borrowed by C{worker_id+1:02d}",
+                        "progress": 0.99, "detail": "Thread"
+                    }
+
+                current_concurrency = 1 + borrowed_tokens
+                stage_desc = f"Resizing({current_concurrency}T)" if current_concurrency > 1 else "Resizing"
+
+                try:
+                    if current_concurrency > 1:
+                        with ThreadPoolExecutor(max_workers=current_concurrency) as chunk_pool:
+                            chunk_results = list(chunk_pool.map(_process_single_page_task, chunk_tasks))
+                    else:
+                        chunk_results = [_process_single_page_task(t) for t in chunk_tasks]
+                    processed_images.extend(chunk_results)
+                finally:
+                    if borrowed_tokens > 0:
+                        with cpu_token_lock:
+                            allocated_tokens.value = max(0, allocated_tokens.value - borrowed_tokens)
+                        for b_wid, prev_info in borrowed_idle_specs:
+                            if status_dict.get(b_wid, {}).get("stage") == "Assisting":
+                                status_dict[b_wid] = prev_info
+
+                done_count = len(processed_images)
+                pct = 0.25 + (0.65 * (done_count / max(1, total_imgs)))
+                status_dict[worker_id] = {
+                    "tier": tier_tag, "stage": stage_desc, "name": archive_path.name,
+                    "progress": pct, "detail": f"{done_count}/{total_imgs}P"
                 }
+        except OSError as e:
+            if e.errno == 28 or "No space left on device" in str(e):
+                return False, "NO_SPACE", 0, 0
+            raise
 
-            current_concurrency = 1 + borrowed_tokens
-            stage_desc = f"Resizing({current_concurrency}T)" if current_concurrency > 1 else "Resizing"
-
-            try:
-                if current_concurrency > 1:
-                    with ThreadPoolExecutor(max_workers=current_concurrency) as chunk_pool:
-                        chunk_results = list(chunk_pool.map(_process_single_page_task, chunk_tasks))
-                else:
-                    chunk_results = [_process_single_page_task(t) for t in chunk_tasks]
-                processed_images.extend(chunk_results)
-            finally:
-                if borrowed_tokens > 0:
-                    with cpu_token_lock:
-                        allocated_tokens.value = max(0, allocated_tokens.value - borrowed_tokens)
-                    for b_wid in borrowed_idle_wids:
-                        status_dict[b_wid] = {
-                            "tier": "-", "stage": "Idle", "name": "-", "progress": 0.0, "detail": ""
-                        }
-
-            done_count = len(processed_images)
-            pct = 0.25 + (0.65 * (done_count / max(1, total_imgs)))
-            status_dict[worker_id] = {
-                "tier": tier_tag, "stage": stage_desc, "name": archive_path.name,
-                "progress": pct, "detail": f"{done_count}/{total_imgs}P"
-            }
-
+        # 階段 3: 在 RAM Disk / Local Temp 內部瞬間封裝好 ZIP/CBZ，並「邊包邊刪」來源暫存檔以保持零重複空間佔用
         status_dict[worker_id] = {
             "tier": tier_tag, "stage": "Packaging", "name": archive_path.name,
-            "progress": 0.95, "detail": "STORE Write"
+            "progress": 0.93, "detail": "RAM Build" if tier_tag == "RAM" else "Local Build"
         }
         out_bytes = 0
-        if processed_images:
-            main_arc = resized_dir / f"{stem_name}{ARCHIVE_MAIN_EXT}"
-            create_zip_store(main_arc, processed_images)
-            if main_arc.exists():
-                out_bytes += main_arc.stat().st_size
-        if animated_images:
-            anim_arc = anim_dir / f"{stem_name}-Animated{ARCHIVE_OTHER_EXT}"
-            create_zip_store(anim_arc, animated_images, root_folder_name=f"{stem_name}-Animated")
-            if anim_arc.exists():
-                out_bytes += anim_arc.stat().st_size
-        if media_files:
-            media_arc = media_dir / f"{stem_name}-Media{ARCHIVE_OTHER_EXT}"
-            create_zip_store(media_arc, media_files, root_folder_name=f"{stem_name}-Media")
-            if media_arc.exists():
-                out_bytes += media_arc.stat().st_size
+        staged_moves = []
+        try:
+            if processed_images:
+                staged_main = staged_out_dir / f"{stem_name}{ARCHIVE_MAIN_EXT}"
+                create_zip_store(staged_main, processed_images, consume_source=True)
+                if staged_main.exists():
+                    out_bytes += staged_main.stat().st_size
+                    staged_moves.append((staged_main, resized_dir))
+            if animated_images:
+                staged_anim = staged_out_dir / f"{stem_name}-Animated{ARCHIVE_OTHER_EXT}"
+                create_zip_store(staged_anim, animated_images, root_folder_name=f"{stem_name}-Animated", consume_source=True)
+                if staged_anim.exists():
+                    out_bytes += staged_anim.stat().st_size
+                    staged_moves.append((staged_anim, anim_dir))
+            if media_files:
+                staged_media = staged_out_dir / f"{stem_name}-Media{ARCHIVE_OTHER_EXT}"
+                create_zip_store(staged_media, media_files, root_folder_name=f"{stem_name}-Media", consume_source=True)
+                if staged_media.exists():
+                    out_bytes += staged_media.stat().st_size
+                    staged_moves.append((staged_media, media_dir))
+            shutil.rmtree(extracted_dir, ignore_errors=True)
+            shutil.rmtree(processed_dir_tmp, ignore_errors=True)
+        except OSError as e:
+            if e.errno == 28 or "No space left on device" in str(e):
+                return False, "NO_SPACE", 0, 0
+            raise
 
-    status_dict[worker_id] = {
-        "tier": tier_tag, "stage": "Archiving", "name": archive_path.name,
-        "progress": 1.0, "detail": "Moving"
-    }
-    safe_move_file(archive_path, original_files_dir)
+        # 階段 4: 組裝完畢後透過最高優先權 (Write-Priority) 立刻搬往目的地資料夾，瞬間騰出 RAM Disk
+        def _flush_to_disk():
+            status_dict[worker_id] = {
+                "tier": tier_tag, "stage": "Archiving", "name": archive_path.name,
+                "progress": 0.98, "detail": "Seq Write"
+            }
+            for st_file, target_d in staged_moves:
+                safe_move_file(st_file, target_d)
+            safe_move_file(archive_path, original_files_dir)
+
+        if io_controller is not None:
+            active_io_streams, waiting_writers, io_lock, max_io_streams = io_controller
+            with io_lock:
+                waiting_writers.value += 1
+            acquired_write = False
+            try:
+                status_dict[worker_id] = {
+                    "tier": tier_tag, "stage": "Queued I/O", "name": archive_path.name,
+                    "progress": 0.96, "detail": "Priority Flush"
+                }
+                while True:
+                    with io_lock:
+                        if active_io_streams.value < max_io_streams:
+                            active_io_streams.value += 1
+                            waiting_writers.value = max(0, waiting_writers.value - 1)
+                            acquired_write = True
+                            break
+                    time.sleep(0.03)
+                _flush_to_disk()
+            finally:
+                with io_lock:
+                    if acquired_write:
+                        active_io_streams.value = max(0, active_io_streams.value - 1)
+                    else:
+                        waiting_writers.value = max(0, waiting_writers.value - 1)
+        else:
+            _flush_to_disk()
+
     return True, "SUCCESS", len(static_images), out_bytes
 
 def worker_task(
     archive_path_str: str, target_tier: str, reserved_mb: float,
     resized_dir_str: str, anim_dir_str: str, media_dir_str: str,
     original_files_dir_str: str, error_dir_str: str, file_err_dir_str: str,
-    worker_id: int, status_dict, recent_logs, ram_manager_tuple, cpu_token_manager
+    worker_id: int, status_dict, recent_logs, ram_manager_tuple, cpu_token_manager,
+    max_w: int = MAX_WIDTH, max_h: int = MAX_HEIGHT, jpeg_quality: int = JPEG_QUALITY,
+    io_controller=None, strict_ram: bool = True
 ):
     archive_path = Path(archive_path_str)
     resized_dir = Path(resized_dir_str)
@@ -687,21 +954,29 @@ def worker_task(
     try:
         ok, reason, img_count, out_bytes = execute_pipeline(
             archive_path, resized_dir, anim_dir, media_dir, original_files_dir,
-            temp_target_dir, tier_tag, worker_id, status_dict, cpu_token_manager
+            temp_target_dir, tier_tag, worker_id, status_dict, cpu_token_manager,
+            max_w=max_w, max_h=max_h, jpeg_quality=jpeg_quality, io_controller=io_controller
         )
 
         if not ok and reason == "NO_SPACE" and temp_target_dir is not None:
-            recent_logs.append(("WARN", clean_name, "RAM limit -> SSD"))
-            tier_tag = "SSD"
-            ok, reason, img_count, out_bytes = execute_pipeline(
-                archive_path, resized_dir, anim_dir, media_dir, original_files_dir,
-                None, tier_tag, worker_id, status_dict, cpu_token_manager
-            )
-            if not ok:
-                safe_move_file(archive_path, error_dir)
-                recent_logs.append(("SYS_ERR", clean_name, "Retry Failed"))
+            if strict_ram:
+                # 強制 RAM Disk 模式下絕不偷偷退回 SSD，先釋放暫存並排回佇列頂端等待 RAM Disk 空間
+                recent_logs.append(("WARN", clean_name, "RAM Busy -> Wait RAM"))
                 status_dict[worker_id] = {"tier": tier_tag, "stage": "Idle", "name": "-", "progress": 0.0, "detail": ""}
-                return archive_path_str, "ERROR", time.time() - start_task_time, 0, orig_bytes, 0
+                return archive_path_str, "RETRY_RAM", time.time() - start_task_time, 0, orig_bytes, 0
+            else:
+                recent_logs.append(("WARN", clean_name, "RAM limit -> SSD"))
+                tier_tag = "SSD"
+                ok, reason, img_count, out_bytes = execute_pipeline(
+                    archive_path, resized_dir, anim_dir, media_dir, original_files_dir,
+                    None, tier_tag, worker_id, status_dict, cpu_token_manager,
+                    max_w=max_w, max_h=max_h, jpeg_quality=jpeg_quality, io_controller=io_controller
+                )
+                if not ok:
+                    safe_move_file(archive_path, error_dir)
+                    recent_logs.append(("SYS_ERR", clean_name, "Retry Failed"))
+                    status_dict[worker_id] = {"tier": tier_tag, "stage": "Idle", "name": "-", "progress": 0.0, "detail": ""}
+                    return archive_path_str, "ERROR", time.time() - start_task_time, 0, orig_bytes, 0
 
         elif not ok and reason in ("CORRUPTED", "NO_VALID_FILES"):
             safe_move_file(archive_path, file_err_dir)
@@ -777,12 +1052,21 @@ class OptimizerThread(QThread):
     finished_signal = pyqtSignal(dict)
     error_signal = pyqtSignal(str)
 
-    def __init__(self, source_dirs_list: list, global_output_dir_str: str, ram_gb: int, strict_ram: bool):
+    def __init__(
+        self, source_dirs_list: list, global_output_dir_str: str,
+        ram_gb: int, strict_ram: bool,
+        max_w: int = MAX_WIDTH, max_h: int = MAX_HEIGHT, jpeg_quality: int = JPEG_QUALITY,
+        io_limit: int = 3
+    ):
         super().__init__()
         self.source_dirs = [Path(d) for d in source_dirs_list]
         self.global_output_dir = Path(global_output_dir_str) if global_output_dir_str else None
         self.ram_gb = ram_gb
         self.strict_ram = strict_ram
+        self.max_w = max_w
+        self.max_h = max_h
+        self.jpeg_quality = jpeg_quality
+        self.io_limit = max(1, io_limit)
         self.is_aborted = False
 
     def abort(self):
@@ -850,6 +1134,7 @@ class OptimizerThread(QThread):
             ram_active = ram_path is not None
 
         ram_budget_mb = (self.ram_gb * 1024 * 0.96) if ram_active else 0.0
+        ram_total_mb = (self.ram_gb * 1024.0) if ram_active else 0.0
         current_allocated_ram = manager.Value('d', 0.0)
         ram_lock = manager.Lock()
         ram_manager_tuple = (current_allocated_ram, ram_budget_mb, ram_lock)
@@ -857,6 +1142,11 @@ class OptimizerThread(QThread):
         allocated_cpu_tokens = manager.Value('i', 0)
         cpu_token_lock = manager.Lock()
         cpu_token_manager = (allocated_cpu_tokens, cpu_token_lock)
+
+        active_io_streams = manager.Value('i', 0)
+        waiting_writers = manager.Value('i', 0)
+        io_lock = manager.Lock()
+        io_controller = (active_io_streams, waiting_writers, io_lock, self.io_limit)
 
         pending_queue = []
         max_inspect_threads = min(32, (os.cpu_count() or 4) * 4)
@@ -893,10 +1183,25 @@ class OptimizerThread(QThread):
                         worker_id = task_meta["wid"]
                         src_root_str = task_meta["src_root"]
                         dest_root_str = task_meta["dest_root"]
+                        orig_item = task_meta["item"]
                         available_workers.add(worker_id)
-                        done_total += 1
                         try:
                             arch_path_done, result_code, cost_sec, page_cnt, f_orig_b, f_out_b = f.result()
+                            if result_code == "RETRY_RAM":
+                                # 強制 RAM Disk 模式下若發生空間不足，調高該檔預留額度並排回佇列最前端重新在 RAM Disk 執行
+                                orig_item["ram_oom_retries"] = orig_item.get("ram_oom_retries", 0) + 1
+                                if orig_item["ram_oom_retries"] >= 3:
+                                    orig_item["force_ssd"] = True
+                                    recent_logs.append(("WARN", sanitize_log_text(orig_item["path"].name), "Exceeds Total RAM -> SSD"))
+                                else:
+                                    orig_item["uncompressed_mb"] = min(
+                                        ram_budget_mb,
+                                        max(orig_item["uncompressed_mb"] * 1.25, ram_budget_mb * 0.5)
+                                    )
+                                pending_queue.insert(0, orig_item)
+                                continue
+
+                            done_total += 1
                             arch_name = Path(arch_path_done).name
                             if result_code == "SUCCESS":
                                 success_count += 1
@@ -919,46 +1224,77 @@ class OptimizerThread(QThread):
                                 duration_sec=cost_sec
                             )
                         except Exception:
+                            done_total += 1
                             fail_err_count += 1
                         self.progress_signal.emit(done_total, len(archive_items))
 
                     while available_workers and pending_queue and not self.is_aborted:
+                        # 按需串流派發 (Just-In-Time Stream Dispatch)：
+                        # 當有任務正在寫出釋放 RAM Disk，或正在讀取解壓的串流數已達 io_limit 時，
+                        # 不提前把多餘任務塞進 Waiting Disk 預佔 RAM Disk 空間，讓閒置核心專心支援 Resizing！
+                        if waiting_writers.value > 0:
+                            break
+                        active_wids = [m["wid"] for m in active_futures.values()]
+                        active_readers = sum(
+                            1 for wid in active_wids
+                            if worker_statuses.get(wid, {}).get("stage") in ("Queued I/O", "Extracting")
+                            and worker_statuses.get(wid, {}).get("progress", 0.0) < 0.25
+                        )
+                        if active_readers >= self.io_limit:
+                            break
+
                         assigned = False
                         for idx, item in enumerate(pending_queue):
                             needed_mb = item["uncompressed_mb"]
-                            if not ram_active or needed_mb > ram_budget_mb:
+                            exceeds_physical_ram = (needed_mb > ram_total_mb) if self.strict_ram else (needed_mb > ram_budget_mb)
+                            if not ram_active or item.get("force_ssd", False) or exceeds_physical_ram:
                                 target_tier = "SSD"
                                 reserved_mb = 0.0
                                 chosen_item = pending_queue.pop(idx)
                                 assigned = True
                                 break
 
+                            effective_needed_mb = min(needed_mb, ram_budget_mb)
                             can_allocate = False
                             with ram_lock:
-                                if current_allocated_ram.value + needed_mb <= ram_budget_mb:
-                                    current_allocated_ram.value += needed_mb
-                                    can_allocate = True
+                                actual_free_mb = get_ram_disk_free_mb()
+                                if current_allocated_ram.value <= 0.01:
+                                    # 當 RAM Disk 處於淨空狀態時，任何小於 RAM Disk 總容量的檔案皆可直接進駐
+                                    if actual_free_mb >= min(effective_needed_mb * 0.90, ram_budget_mb * 0.90):
+                                        current_allocated_ram.value += effective_needed_mb
+                                        can_allocate = True
+                                else:
+                                    # 雙重空間檢核：帳面預留與實體剩餘空間皆足夠才放行
+                                    if (current_allocated_ram.value + effective_needed_mb <= ram_budget_mb) and (actual_free_mb >= effective_needed_mb):
+                                        current_allocated_ram.value += effective_needed_mb
+                                        can_allocate = True
 
                             if can_allocate:
                                 target_tier = "RAM"
-                                reserved_mb = needed_mb
+                                reserved_mb = effective_needed_mb
                                 chosen_item = pending_queue.pop(idx)
                                 assigned = True
                                 break
                             else:
-                                if self.strict_ram: continue
+                                if self.strict_ram:
+                                    continue
                                 else:
+                                    if idx == 0:
+                                        item["retries"] += 1
                                     if item["retries"] >= MAX_RAM_RETRIES:
                                         target_tier = "SSD"
                                         reserved_mb = 0.0
                                         chosen_item = pending_queue.pop(idx)
                                         assigned = True
                                         break
-                                    else:
-                                        item["retries"] += 1
 
                         if assigned:
                             worker_id = available_workers.pop()
+                            # 立即標記為 Queued I/O，確保迴圈能精確統計 active_readers
+                            worker_statuses[worker_id] = {
+                                "tier": target_tier, "stage": "Queued I/O",
+                                "name": chosen_item["path"].name, "progress": 0.0, "detail": "Starting"
+                            }
                             # 動態計算該檔案的產出目錄
                             src_root = chosen_item["src_root"]
                             dest_root = self.global_output_dir if self.global_output_dir else src_root
@@ -975,12 +1311,14 @@ class OptimizerThread(QThread):
                                 worker_task, str(chosen_item["path"]), target_tier, reserved_mb,
                                 str(resized_dir), str(anim_dir), str(media_dir),
                                 str(original_files_dir), str(error_dir), str(file_err_dir),
-                                worker_id, worker_statuses, recent_logs, ram_manager_tuple, cpu_token_manager
+                                worker_id, worker_statuses, recent_logs, ram_manager_tuple, cpu_token_manager,
+                                self.max_w, self.max_h, self.jpeg_quality, io_controller, self.strict_ram
                             )
                             active_futures[f] = {
                                 "wid": worker_id,
                                 "src_root": str(src_root),
-                                "dest_root": str(dest_root)
+                                "dest_root": str(dest_root),
+                                "item": chosen_item
                             }
                         else:
                             break
@@ -1156,9 +1494,15 @@ class DropLineEdit(QLineEdit):
 
     def dragEnterEvent(self, event: QDragEnterEvent):
         if event.mimeData().hasUrls():
+            self.setStyleSheet("QLineEdit { border: 1.5px solid #38bdf8; background-color: #131c31; }")
             event.acceptProposedAction()
 
+    def dragLeaveEvent(self, event):
+        self.setStyleSheet("")
+        super().dragLeaveEvent(event)
+
     def dropEvent(self, event: QDropEvent):
+        self.setStyleSheet("")
         for url in event.mimeData().urls():
             local_path = url.toLocalFile()
             if os.path.isdir(local_path):
@@ -1166,27 +1510,36 @@ class DropLineEdit(QLineEdit):
                 break
 
 class DropListWidget(QListWidget):
-    """支援直接拖曳多個資料夾加入清單的自訂 ListWidget"""
+    """支援直接拖曳多個資料夾加入清單並具備空白引導與高亮的自訂 ListWidget"""
     items_changed_signal = pyqtSignal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setAcceptDrops(True)
+        self._dragging = False
 
     def dragEnterEvent(self, event: QDragEnterEvent):
         if event.mimeData().hasUrls():
+            self._dragging = True
+            self.setStyleSheet("QListWidget { border: 2px dashed #38bdf8; background-color: #131c31; }")
             event.acceptProposedAction()
 
     def dragMoveEvent(self, event):
         if event.mimeData().hasUrls():
             event.acceptProposedAction()
 
+    def dragLeaveEvent(self, event):
+        self._dragging = False
+        self.setStyleSheet("")
+        super().dragLeaveEvent(event)
+
     def dropEvent(self, event: QDropEvent):
+        self._dragging = False
+        self.setStyleSheet("")
         added = False
         for url in event.mimeData().urls():
             local_path = url.toLocalFile()
             if os.path.isdir(local_path):
-                # 避免重複加入
                 existing = [self.item(i).text() for i in range(self.count())]
                 if local_path not in existing:
                     self.addItem(local_path)
@@ -1194,18 +1547,36 @@ class DropListWidget(QListWidget):
         if added:
             self.items_changed_signal.emit()
 
+    def paintEvent(self, event):
+        super().paintEvent(event)
+        if self.count() == 0:
+            painter = QPainter(self.viewport())
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+            color = QColor("#38bdf8") if self._dragging else QColor("#64748b")
+            painter.setPen(color)
+            font = painter.font()
+            font.setPointSize(13)
+            font.setBold(self._dragging)
+            painter.setFont(font)
+            hint_text = "📂  Drag & Drop Comic Folders Here\nor click 'Add Folder...' on the right (Double-click item to open in Finder)"
+            painter.drawText(self.viewport().rect(), Qt.AlignmentFlag.AlignCenter, hint_text)
+            painter.end()
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Comic Optimizer & Fast Packer (macOS)")
-        self.resize(1300, 880)
+        self.resize(1340, 900)
         self.setAcceptDrops(True)
+        self.setStyleSheet(MODERN_DARK_STYLESHEET)
         self.worker_thread = None
+        self.batch_start_time = None
         self.num_workers = max(1, os.cpu_count() - 1)
         HistoryDatabase.init_db()
         self.init_ui()
         self.load_user_settings()
         self.refresh_history_view()
+        self.update_monitor_visibility()
 
     def closeEvent(self, event: QCloseEvent):
         self.save_user_settings()
@@ -1239,6 +1610,36 @@ class MainWindow(QMainWindow):
     def update_sources_count_label(self):
         cnt = self.sources_list.count()
         self.sources_count_label.setText(f"Sources Selected: {cnt}")
+        self.sources_list.viewport().update()
+
+    @staticmethod
+    def _create_kpi_card(title_text: str, value_text: str, sub_text: str, accent_color: str):
+        card = QFrame()
+        card.setStyleSheet(f"""
+            QFrame {{
+                background-color: #0f172a;
+                border: 1px solid #334155;
+                border-left: 4px solid {accent_color};
+                border-radius: 8px;
+            }}
+        """)
+        lay = QVBoxLayout(card)
+        lay.setContentsMargins(14, 10, 14, 10)
+        lay.setSpacing(3)
+
+        title_lbl = QLabel(title_text)
+        title_lbl.setStyleSheet("color: #94a3b8; font-size: 11px; font-weight: 700; border: none;")
+
+        val_lbl = QLabel(value_text)
+        val_lbl.setStyleSheet(f"color: {accent_color}; font-size: 20px; font-weight: 800; border: none;")
+
+        sub_lbl = QLabel(sub_text)
+        sub_lbl.setStyleSheet("color: #64748b; font-size: 11px; font-weight: 600; border: none;")
+
+        lay.addWidget(title_lbl)
+        lay.addWidget(val_lbl)
+        lay.addWidget(sub_lbl)
+        return card, val_lbl, sub_lbl
 
     def init_ui(self):
         central_widget = QWidget()
@@ -1252,25 +1653,27 @@ class MainWindow(QMainWindow):
         # ---- Tab 1: Comic Optimizer (Multi-source) ----
         tab_opt = QWidget()
         layout_opt = QVBoxLayout(tab_opt)
-        layout_opt.setContentsMargins(8, 8, 8, 8)
-        layout_opt.setSpacing(8)
+        layout_opt.setContentsMargins(12, 12, 12, 12)
+        layout_opt.setSpacing(10)
 
         # 複數來源清單區
         src_box = QHBoxLayout()
         self.sources_list = DropListWidget()
         self.sources_list.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
-        self.sources_list.setStyleSheet("QListWidget { font-size: 0.9rem; }")
+        self.sources_list.setMinimumHeight(105)
         self.sources_list.items_changed_signal.connect(self.on_sources_list_dropped)
-        
+        self.sources_list.itemDoubleClicked.connect(lambda item: reveal_in_finder(Path(item.text())))
+
         src_btn_layout = QVBoxLayout()
-        add_src_btn = QPushButton("Add Folder...")
+        src_btn_layout.setSpacing(6)
+        add_src_btn = QPushButton("+ Add Folder...")
         add_src_btn.clicked.connect(self.browse_add_source)
-        remove_src_btn = QPushButton("Remove")
+        remove_src_btn = QPushButton("Remove Selected")
         remove_src_btn.clicked.connect(self.remove_selected_source)
         clear_src_btn = QPushButton("Clear All")
         clear_src_btn.clicked.connect(self.clear_all_sources)
         self.sources_count_label = QLabel("Sources Selected: 0")
-        self.sources_count_label.setStyleSheet("font-weight: bold; color: #38bdf8;")
+        self.sources_count_label.setStyleSheet("font-weight: 700; color: #38bdf8; font-size: 12px;")
 
         src_btn_layout.addWidget(add_src_btn)
         src_btn_layout.addWidget(remove_src_btn)
@@ -1278,7 +1681,7 @@ class MainWindow(QMainWindow):
         src_btn_layout.addStretch()
         src_btn_layout.addWidget(self.sources_count_label)
 
-        src_box.addWidget(self.sources_list, stretch=4)
+        src_box.addWidget(self.sources_list, stretch=5)
         src_box.addLayout(src_btn_layout, stretch=1)
         layout_opt.addLayout(src_box)
 
@@ -1289,16 +1692,35 @@ class MainWindow(QMainWindow):
         self.path_output_opt.textChanged.connect(lambda _: self.save_user_settings())
         browse_out_btn = QPushButton("Browse...")
         browse_out_btn.clicked.connect(lambda: self.browse_folder(self.path_output_opt))
+        open_out_btn = QPushButton("Open in Finder")
+        open_out_btn.clicked.connect(self.open_current_output_in_finder)
         clear_out_btn = QPushButton("Clear")
         clear_out_btn.clicked.connect(lambda: self.path_output_opt.clear())
-        row_out.addWidget(QLabel("Output:"))
+        out_lbl = QLabel("Output:")
+        out_lbl.setStyleSheet("font-weight: 600; color: #cbd5e1;")
+        row_out.addWidget(out_lbl)
         row_out.addWidget(self.path_output_opt, stretch=2)
         row_out.addWidget(browse_out_btn)
+        row_out.addWidget(open_out_btn)
         row_out.addWidget(clear_out_btn)
         layout_opt.addLayout(row_out)
 
-        # 控制與啟動列
+        # 控制與啟動列 (包含畫質與解析度 Preset)
         row_ctrl = QHBoxLayout()
+        row_ctrl.setSpacing(10)
+
+        self.res_preset_combo = QComboBox()
+        for label, _, _ in RESOLUTION_PRESETS:
+            self.res_preset_combo.addItem(label)
+        self.res_preset_combo.setCurrentIndex(0)
+        self.res_preset_combo.currentIndexChanged.connect(lambda _: self.save_user_settings())
+
+        self.quality_spin = QSpinBox()
+        self.quality_spin.setRange(50, 100)
+        self.quality_spin.setValue(JPEG_QUALITY)
+        self.quality_spin.setSuffix(" %")
+        self.quality_spin.valueChanged.connect(lambda _: self.save_user_settings())
+
         rec_ram = get_recommended_ram_disk_gb()
         self.ram_spin = QSpinBox()
         self.ram_spin.setRange(0, 128)
@@ -1308,179 +1730,268 @@ class MainWindow(QMainWindow):
 
         self.strict_check = QCheckBox("Strict RAM")
         self.strict_check.setChecked(True)
+        self.strict_check.setToolTip("Wait for RAM Disk space instead of spilling over to SSD")
         self.strict_check.toggled.connect(lambda _: self.save_user_settings())
 
-        self.start_btn_opt = QPushButton("Start Optimizer")
-        self.start_btn_opt.setStyleSheet("background-color: #059669; color: white; font-weight: bold; padding: 6px 16px;")
+        self.io_limit_spin = QSpinBox()
+        self.io_limit_spin.setRange(1, max(1, self.num_workers))
+        self.io_limit_spin.setValue(3)
+        self.io_limit_spin.setSuffix(" Streams")
+        self.io_limit_spin.setToolTip(
+            "Max concurrent disk reads/writes (Recommended: 2~3 for External DAS/HDD/NAS to prevent disk thrashing and free up CPU cores for resizing)"
+        )
+        self.io_limit_spin.valueChanged.connect(lambda _: self.save_user_settings())
+
+        self.start_btn_opt = QPushButton("▶  Start Optimizer")
+        self.start_btn_opt.setStyleSheet("""
+            QPushButton {
+                background-color: #059669; color: white; font-weight: bold;
+                padding: 7px 20px; border: 1px solid #10b981; font-size: 13px;
+            }
+            QPushButton:hover { background-color: #10b981; }
+            QPushButton:disabled { background-color: #1e293b; color: #475569; border-color: #334155; }
+        """)
         self.start_btn_opt.clicked.connect(self.start_optimizer)
 
+        row_ctrl.addWidget(QLabel("Max Resolution:"))
+        row_ctrl.addWidget(self.res_preset_combo)
+        row_ctrl.addSpacing(6)
+        row_ctrl.addWidget(QLabel("JPEG Quality:"))
+        row_ctrl.addWidget(self.quality_spin)
+        row_ctrl.addSpacing(6)
         row_ctrl.addWidget(QLabel("RAM Disk:"))
         row_ctrl.addWidget(self.ram_spin)
         row_ctrl.addWidget(self.strict_check)
+        row_ctrl.addSpacing(6)
+        row_ctrl.addWidget(QLabel("Disk I/O Limit:"))
+        row_ctrl.addWidget(self.io_limit_spin)
         row_ctrl.addStretch()
         row_ctrl.addWidget(self.start_btn_opt)
         layout_opt.addLayout(row_ctrl)
 
-        self.tabs.addTab(tab_opt, "Comic Optimizer (Multi-Source & Resize)")
+        self.tabs.addTab(tab_opt, "⚡ Comic Optimizer (Multi-Source & Resize)")
 
         # ---- Tab 2: First-level Folder Store Packer ----
         tab_pack = QWidget()
-        layout_pack = QHBoxLayout(tab_pack)
-        layout_pack.setContentsMargins(8, 8, 8, 8)
+        layout_pack = QVBoxLayout(tab_pack)
+        layout_pack.setContentsMargins(12, 16, 12, 16)
+        layout_pack.setSpacing(12)
 
+        pack_desc = QLabel(
+            "Batch-pack all first-level subfolders inside the target directory into zero-compression archives (ZIP_STORED / zip -0)."
+        )
+        pack_desc.setStyleSheet("color: #94a3b8; font-size: 12px;")
+        layout_pack.addWidget(pack_desc)
+
+        row_pack = QHBoxLayout()
         self.path_input_pack = DropLineEdit()
-        self.path_input_pack.setPlaceholderText("Target folder whose subfolders will be packed to zip (zip -0 -r)...")
+        self.path_input_pack.setPlaceholderText("Drag & drop target folder here, or click Browse...")
         self.path_input_pack.textChanged.connect(lambda _: self.save_user_settings())
         browse_btn_pack = QPushButton("Browse...")
         browse_btn_pack.clicked.connect(lambda: self.browse_folder(self.path_input_pack))
+        open_pack_btn = QPushButton("Open in Finder")
+        open_pack_btn.clicked.connect(lambda: reveal_in_finder(Path(self.path_input_pack.text().strip())) if self.path_input_pack.text().strip() else None)
 
         self.cbz_format_check = QCheckBox("Output .cbz instead of .zip")
         self.cbz_format_check.setChecked(False)
         self.cbz_format_check.toggled.connect(lambda _: self.save_user_settings())
 
-        self.start_btn_pack = QPushButton("Pack Subfolders")
-        self.start_btn_pack.setStyleSheet("background-color: #2563eb; color: white; font-weight: bold; padding: 6px 14px;")
+        self.start_btn_pack = QPushButton("▶  Pack Subfolders")
+        self.start_btn_pack.setStyleSheet("""
+            QPushButton {
+                background-color: #2563eb; color: white; font-weight: bold;
+                padding: 7px 18px; border: 1px solid #3b82f6; font-size: 13px;
+            }
+            QPushButton:hover { background-color: #3b82f6; }
+            QPushButton:disabled { background-color: #1e293b; color: #475569; border-color: #334155; }
+        """)
         self.start_btn_pack.clicked.connect(self.start_folder_packer)
 
-        layout_pack.addWidget(QLabel("Target:"))
-        layout_pack.addWidget(self.path_input_pack, stretch=2)
-        layout_pack.addWidget(browse_btn_pack)
-        layout_pack.addWidget(self.cbz_format_check)
-        layout_pack.addWidget(self.start_btn_pack)
-        self.tabs.addTab(tab_pack, "Quick Folder Packer (Store zip -0)")
+        row_pack.addWidget(QLabel("Target:"))
+        row_pack.addWidget(self.path_input_pack, stretch=2)
+        row_pack.addWidget(browse_btn_pack)
+        row_pack.addWidget(open_pack_btn)
+        row_pack.addSpacing(8)
+        row_pack.addWidget(self.cbz_format_check)
+        row_pack.addSpacing(8)
+        row_pack.addWidget(self.start_btn_pack)
+        layout_pack.addLayout(row_pack)
+        layout_pack.addStretch()
+        self.tabs.addTab(tab_pack, "📦 Quick Folder Packer (Store zip -0)")
 
-        # ---- Tab 3: History & Statistics ----
+        # ---- Tab 3: History & Statistics (Full-Height Workspace) ----
         tab_hist = QWidget()
         layout_hist = QVBoxLayout(tab_hist)
-        layout_hist.setContentsMargins(8, 8, 8, 8)
-        layout_hist.setSpacing(8)
+        layout_hist.setContentsMargins(12, 12, 12, 12)
+        layout_hist.setSpacing(12)
 
-        # 統計摘要列
-        stats_frame = QFrame()
-        stats_frame.setStyleSheet("QFrame { background-color: #1e293b; border-radius: 6px; padding: 6px; }")
-        stats_layout = QHBoxLayout(stats_frame)
-        stats_layout.setContentsMargins(10, 6, 10, 6)
+        # 頂部 4 張大字體 KPI 數據卡
+        kpi_row = QHBoxLayout()
+        kpi_row.setSpacing(12)
 
-        self.stat_files_label = QLabel("Processed: 0 OK (0 Pages)")
-        self.stat_files_label.setStyleSheet("font-weight: bold; color: #f8fafc; font-size: 0.92rem;")
-        self.stat_orig_label = QLabel("Original: 0 B")
-        self.stat_orig_label.setStyleSheet("font-weight: bold; color: #94a3b8; font-size: 0.92rem;")
-        self.stat_out_label = QLabel("Optimized: 0 B")
-        self.stat_out_label.setStyleSheet("font-weight: bold; color: #38bdf8; font-size: 0.92rem;")
-        self.stat_saved_label = QLabel("Total Saved: 0 B (▼ 0.0%)")
-        self.stat_saved_label.setStyleSheet("font-weight: bold; color: #10b981; font-size: 0.95rem;")
+        c1, self.kpi_files_val, self.kpi_files_sub = self._create_kpi_card(
+            "PROCESSED ARCHIVES", "0", "0 Pages | 0 Errors", "#f8fafc"
+        )
+        c2, self.kpi_orig_val, self.kpi_orig_sub = self._create_kpi_card(
+            "ALL-TIME ORIGINAL SIZE", "0 B", "Raw input archives", "#94a3b8"
+        )
+        c3, self.kpi_out_val, self.kpi_out_sub = self._create_kpi_card(
+            "ALL-TIME OPTIMIZED SIZE", "0 B", "Resized + Media output", "#38bdf8"
+        )
+        c4, self.kpi_saved_val, self.kpi_saved_sub = self._create_kpi_card(
+            "TOTAL SPACE SAVED", "0 B", "▼ 0.0% Reduction", "#10b981"
+        )
 
-        stats_layout.addWidget(self.stat_files_label)
-        stats_layout.addStretch()
-        stats_layout.addWidget(self.stat_orig_label)
-        stats_layout.addStretch()
-        stats_layout.addWidget(self.stat_out_label)
-        stats_layout.addStretch()
-        stats_layout.addWidget(self.stat_saved_label)
-        layout_hist.addWidget(stats_frame)
+        kpi_row.addWidget(c1, stretch=1)
+        kpi_row.addWidget(c2, stretch=1)
+        kpi_row.addWidget(c3, stretch=1)
+        kpi_row.addWidget(c4, stretch=1)
+        layout_hist.addLayout(kpi_row)
 
         # 搜尋與管理列
         hist_ctrl_layout = QHBoxLayout()
         self.hist_search_input = QLineEdit()
-        self.hist_search_input.setPlaceholderText("Search history by filename, folder, or status (SUCCESS / FILE_ERR)...")
+        self.hist_search_input.setPlaceholderText("🔍 Filter by filename, source path, or status (SUCCESS / FILE_ERR)...")
         self.hist_search_input.textChanged.connect(lambda _: self.refresh_history_view())
 
+        reveal_hist_btn = QPushButton("Open Selected in Finder")
+        reveal_hist_btn.clicked.connect(self.reveal_selected_history_in_finder)
         refresh_hist_btn = QPushButton("Refresh")
         refresh_hist_btn.clicked.connect(self.refresh_history_view)
         export_csv_btn = QPushButton("Export CSV...")
         export_csv_btn.clicked.connect(self.export_history_csv)
         clear_hist_btn = QPushButton("Clear History")
-        clear_hist_btn.setStyleSheet("color: #f87171;")
+        clear_hist_btn.setStyleSheet("QPushButton { color: #f87171; }")
         clear_hist_btn.clicked.connect(self.clear_history_records)
 
-        hist_ctrl_layout.addWidget(QLabel("Filter:"))
         hist_ctrl_layout.addWidget(self.hist_search_input, stretch=2)
+        hist_ctrl_layout.addWidget(reveal_hist_btn)
         hist_ctrl_layout.addWidget(refresh_hist_btn)
         hist_ctrl_layout.addWidget(export_csv_btn)
         hist_ctrl_layout.addWidget(clear_hist_btn)
         layout_hist.addLayout(hist_ctrl_layout)
 
-        # 歷史明細表格
+        # 歷史明細表格 (雙擊可在 Finder 開啟)
         self.history_table = QTableWidget(0, 8)
         self.history_table.setHorizontalHeaderLabels([
-            "Timestamp", "Filename", "Status", "Pages",
-            "Original Size", "Optimized Size", "Saved (%)", "Duration"
+            "Timestamp", "Filename (Double-click to open folder)", "Status", "Pages",
+            "Original Size", "Optimized Size", "Space Saved (%)", "Duration"
         ])
         self.history_table.verticalHeader().setVisible(False)
+        self.history_table.verticalHeader().setDefaultSectionSize(28)
+        self.history_table.setAlternatingRowColors(True)
+        self.history_table.setShowGrid(False)
         self.history_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.history_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
-        self.history_table.setMinimumHeight(180)
+        self.history_table.cellDoubleClicked.connect(self.on_history_row_double_clicked)
 
         h_header = self.history_table.horizontalHeader()
         h_header.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
-        self.history_table.setColumnWidth(0, 145)
-        self.history_table.setColumnWidth(1, 380)
-        self.history_table.setColumnWidth(2, 85)
-        self.history_table.setColumnWidth(3, 65)
-        self.history_table.setColumnWidth(4, 110)
-        self.history_table.setColumnWidth(5, 110)
-        self.history_table.setColumnWidth(6, 150)
-        self.history_table.setColumnWidth(7, 80)
-        layout_hist.addWidget(self.history_table)
+        h_header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        self.history_table.setColumnWidth(0, 150)
+        self.history_table.setColumnWidth(2, 95)
+        self.history_table.setColumnWidth(3, 75)
+        self.history_table.setColumnWidth(4, 115)
+        self.history_table.setColumnWidth(5, 115)
+        self.history_table.setColumnWidth(6, 165)
+        self.history_table.setColumnWidth(7, 85)
+        layout_hist.addWidget(self.history_table, stretch=1)
 
-        self.tabs.addTab(tab_hist, "History & Statistics (All-Time)")
+        self.tabs.addTab(tab_hist, "📊 History & Statistics (All-Time)")
         self.tabs.currentChanged.connect(self.on_tab_changed)
+        main_layout.addWidget(self.tabs)
 
-        top_bar_layout = QHBoxLayout()
-        top_bar_layout.addWidget(self.tabs, stretch=1)
-        self.abort_btn = QPushButton("Abort")
-        self.abort_btn.setEnabled(False)
-        self.abort_btn.setStyleSheet("background-color: #dc2626; color: white; font-weight: bold; padding: 8px 18px;")
-        self.abort_btn.clicked.connect(self.abort_processing)
-        top_bar_layout.addWidget(self.abort_btn)
-        main_layout.addLayout(top_bar_layout)
+        # ---- 即時執行監控區 (切換到 Tab 3 時自動隱藏，將空間留給歷史大表) ----
+        self.monitor_container = QWidget()
+        monitor_layout = QVBoxLayout(self.monitor_container)
+        monitor_layout.setContentsMargins(0, 0, 0, 0)
+        monitor_layout.setSpacing(8)
 
         prog_layout = QHBoxLayout()
         self.overall_progress = QProgressBar()
         self.overall_progress.setValue(0)
         self.status_label = QLabel("Idle")
+        self.status_label.setStyleSheet("font-weight: 700; color: #38bdf8; min-width: 115px;")
+        self.eta_label = QLabel("Elapsed: 00:00 | ETA: --:--")
+        self.eta_label.setStyleSheet("color: #94a3b8; font-weight: 600;")
+
         self.ram_usage_label = QLabel("RAM Disk: Disabled")
+        self.ram_usage_label.setStyleSheet("color: #cbd5e1; font-weight: 600;")
+        self.ram_bar = QProgressBar()
+        self.ram_bar.setRange(0, 100)
+        self.ram_bar.setValue(0)
+        self.ram_bar.setFixedWidth(85)
+        self.ram_bar.setTextVisible(False)
+
+        self.abort_btn = QPushButton("⏹  Abort")
+        self.abort_btn.setEnabled(False)
+        self.abort_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #dc2626; color: white; font-weight: bold;
+                padding: 4px 14px; border: 1px solid #ef4444;
+            }
+            QPushButton:hover { background-color: #ef4444; }
+            QPushButton:disabled { background-color: #1e293b; color: #475569; border-color: #334155; }
+        """)
+        self.abort_btn.clicked.connect(self.abort_processing)
+
         prog_layout.addWidget(self.overall_progress, stretch=3)
+        prog_layout.addSpacing(8)
         prog_layout.addWidget(self.status_label)
+        prog_layout.addSpacing(6)
+        prog_layout.addWidget(self.eta_label)
+        prog_layout.addSpacing(10)
         prog_layout.addWidget(self.ram_usage_label)
-        main_layout.addLayout(prog_layout)
+        prog_layout.addWidget(self.ram_bar)
+        prog_layout.addSpacing(8)
+        prog_layout.addWidget(self.abort_btn)
+        monitor_layout.addLayout(prog_layout)
 
         splitter = QSplitter(Qt.Orientation.Horizontal)
 
         self.worker_table = QTableWidget(self.num_workers, 5)
         self.worker_table.setHorizontalHeaderLabels(["Core", "Tier", "Stage", "Current Task", "Progress / Detail"])
         self.worker_table.verticalHeader().setVisible(False)
+        self.worker_table.verticalHeader().setDefaultSectionSize(26)
+        self.worker_table.setAlternatingRowColors(True)
+        self.worker_table.setShowGrid(False)
         self.worker_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.worker_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
 
         w_header = self.worker_table.horizontalHeader()
         w_header.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
-        self.worker_table.setColumnWidth(0, 60)
-        self.worker_table.setColumnWidth(1, 70)
+        w_header.setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
+        self.worker_table.setColumnWidth(0, 58)
+        self.worker_table.setColumnWidth(1, 68)
         self.worker_table.setColumnWidth(2, 120)
-        self.worker_table.setColumnWidth(3, 380)
         self.worker_table.setColumnWidth(4, 130)
         splitter.addWidget(self.worker_table)
 
         self.log_table = QTableWidget(0, 3)
         self.log_table.setHorizontalHeaderLabels(["Status", "Target Name", "Stats"])
         self.log_table.verticalHeader().setVisible(False)
+        self.log_table.verticalHeader().setDefaultSectionSize(26)
+        self.log_table.setAlternatingRowColors(True)
+        self.log_table.setShowGrid(False)
         self.log_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.log_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
 
         l_header = self.log_table.horizontalHeader()
         l_header.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
-        self.log_table.setColumnWidth(0, 90)
-        self.log_table.setColumnWidth(1, 320)
-        self.log_table.setColumnWidth(2, 120)
+        l_header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        self.log_table.setColumnWidth(0, 88)
+        self.log_table.setColumnWidth(2, 125)
         splitter.addWidget(self.log_table)
 
         splitter.setStretchFactor(0, 6)
         splitter.setStretchFactor(1, 4)
-        main_layout.addWidget(splitter, stretch=1)
+        monitor_layout.addWidget(splitter, stretch=1)
+        main_layout.addWidget(self.monitor_container, stretch=1)
 
         for i in range(self.num_workers):
-            self.worker_table.setItem(i, 0, QTableWidgetItem(f"C{i+1:02d}"))
+            c_item = QTableWidgetItem(f"C{i+1:02d}")
+            c_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            self.worker_table.setItem(i, 0, c_item)
             self.worker_table.setItem(i, 1, QTableWidgetItem("-"))
             self.worker_table.setItem(i, 2, QTableWidgetItem("Idle"))
             self.worker_table.setItem(i, 3, QTableWidgetItem("-"))
@@ -1489,6 +2000,34 @@ class MainWindow(QMainWindow):
         self.ram_timer = QTimer(self)
         self.ram_timer.timeout.connect(self.update_ram_usage)
         self.ram_timer.start(1000)
+
+    def update_monitor_visibility(self):
+        is_history_tab = (self.tabs.currentIndex() == 2)
+        self.monitor_container.setVisible(not is_history_tab)
+        self.tabs.parentWidget().layout().setStretchFactor(self.tabs, 1 if is_history_tab else 0)
+
+    def open_current_output_in_finder(self):
+        out_p = self.path_output_opt.text().strip()
+        if out_p and os.path.exists(out_p):
+            reveal_in_finder(Path(out_p))
+        elif self.sources_list.count() > 0:
+            reveal_in_finder(Path(self.sources_list.item(0).text()))
+
+    def on_history_row_double_clicked(self, row: int, _col: int):
+        item = self.history_table.item(row, 1)
+        if not item:
+            return
+        out_dir = item.data(Qt.ItemDataRole.UserRole)
+        src_dir = item.data(Qt.ItemDataRole.UserRole + 1)
+        if out_dir and Path(out_dir).exists():
+            reveal_in_finder(Path(out_dir))
+        elif src_dir and Path(src_dir).exists():
+            reveal_in_finder(Path(src_dir))
+
+    def reveal_selected_history_in_finder(self):
+        row = self.history_table.currentRow()
+        if row >= 0:
+            self.on_history_row_double_clicked(row, 1)
 
     def browse_add_source(self):
         folder = QFileDialog.getExistingDirectory(self, "Add Source Folder")
@@ -1515,6 +2054,7 @@ class MainWindow(QMainWindow):
     def on_tab_changed(self, idx: int):
         if idx == 2:
             self.refresh_history_view()
+        self.update_monitor_visibility()
         self.save_user_settings()
 
     def load_user_settings(self):
@@ -1536,6 +2076,14 @@ class MainWindow(QMainWindow):
                 self.ram_spin.setValue(max(0, min(128, cfg["ram_gb"])))
             if "strict_ram" in cfg:
                 self.strict_check.setChecked(bool(cfg["strict_ram"]))
+            if "resolution_preset_index" in cfg and isinstance(cfg["resolution_preset_index"], int):
+                p_idx = cfg["resolution_preset_index"]
+                if 0 <= p_idx < len(RESOLUTION_PRESETS):
+                    self.res_preset_combo.setCurrentIndex(p_idx)
+            if "jpeg_quality" in cfg and isinstance(cfg["jpeg_quality"], int):
+                self.quality_spin.setValue(max(50, min(100, cfg["jpeg_quality"])))
+            if "io_limit" in cfg and isinstance(cfg["io_limit"], int):
+                self.io_limit_spin.setValue(max(1, min(self.num_workers, cfg["io_limit"])))
             if "pack_target_dir" in cfg:
                 self.path_input_pack.setText(str(cfg["pack_target_dir"]))
             if "pack_cbz_format" in cfg:
@@ -1555,6 +2103,9 @@ class MainWindow(QMainWindow):
             "output_dir": self.path_output_opt.text().strip(),
             "ram_gb": self.ram_spin.value(),
             "strict_ram": self.strict_check.isChecked(),
+            "resolution_preset_index": self.res_preset_combo.currentIndex(),
+            "jpeg_quality": self.quality_spin.value(),
+            "io_limit": self.io_limit_spin.value(),
             "pack_target_dir": self.path_input_pack.text().strip(),
             "pack_cbz_format": self.cbz_format_check.isChecked(),
             "current_tab_index": self.tabs.currentIndex(),
@@ -1571,10 +2122,12 @@ class MainWindow(QMainWindow):
         saved_b = stats["total_saved_bytes"]
         saved_pct = (saved_b / orig_b * 100.0) if orig_b > 0 else 0.0
 
-        self.stat_files_label.setText(f"Processed: {ok_cnt:,} OK / {err_cnt:,} Err ({pages:,} Pages)")
-        self.stat_orig_label.setText(f"Original: {format_bytes(orig_b)}")
-        self.stat_out_label.setText(f"Optimized: {format_bytes(out_b)}")
-        self.stat_saved_label.setText(f"Total Saved: {format_bytes(max(0, saved_b))} (▼ {saved_pct:.1f}%)")
+        self.kpi_files_val.setText(f"{ok_cnt:,} OK")
+        self.kpi_files_sub.setText(f"{pages:,} Pages  |  {err_cnt:,} Errors")
+        self.kpi_orig_val.setText(format_bytes(orig_b))
+        self.kpi_out_val.setText(format_bytes(out_b))
+        self.kpi_saved_val.setText(format_bytes(max(0, saved_b)))
+        self.kpi_saved_sub.setText(f"▼ {saved_pct:.1f}% Storage Reduction")
 
         search_kw = self.hist_search_input.text() if hasattr(self, "hist_search_input") else ""
         rows = HistoryDatabase.query_records(search_kw, limit=1000)
@@ -1587,7 +2140,9 @@ class MainWindow(QMainWindow):
             ts_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
 
             fn_item = QTableWidgetItem(fname)
-            fn_item.setToolTip(f"File: {fname}\nSource: {src_d}\nOutput: {out_d}")
+            fn_item.setToolTip(f"File: {fname}\nSource: {src_d}\nOutput: {out_d}\n(Double-click to open in Finder)")
+            fn_item.setData(Qt.ItemDataRole.UserRole, out_d)
+            fn_item.setData(Qt.ItemDataRole.UserRole + 1, src_d)
 
             st_item = QTableWidgetItem(status)
             st_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -1668,8 +2223,13 @@ class MainWindow(QMainWindow):
             self.refresh_history_view()
 
     def update_ram_usage(self):
-        text, _ = get_ram_disk_usage()
+        text, pct = get_ram_disk_usage()
         self.ram_usage_label.setText(f"RAM Disk: {text}")
+        self.ram_bar.setValue(int(min(100.0, max(0.0, pct))))
+        if pct >= 85.0:
+            self.ram_bar.setStyleSheet("QProgressBar::chunk { background-color: #f59e0b; border-radius: 4px; }")
+        else:
+            self.ram_bar.setStyleSheet("QProgressBar::chunk { background-color: #10b981; border-radius: 4px; }")
 
     def start_optimizer(self):
         source_dirs = [self.sources_list.item(i).text() for i in range(self.sources_list.count())]
@@ -1688,13 +2248,21 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Input Error", "The specified output directory does not exist.")
             return
 
+        preset_idx = self.res_preset_combo.currentIndex()
+        _, max_w, max_h = RESOLUTION_PRESETS[preset_idx] if 0 <= preset_idx < len(RESOLUTION_PRESETS) else (None, MAX_WIDTH, MAX_HEIGHT)
+        jpeg_q = self.quality_spin.value()
+
         self.save_user_settings()
         self.prepare_ui_for_start()
         self.worker_thread = OptimizerThread(
             source_dirs_list=source_dirs,
             global_output_dir_str=out_path,
             ram_gb=self.ram_spin.value(),
-            strict_ram=self.strict_check.isChecked()
+            strict_ram=self.strict_check.isChecked(),
+            max_w=max_w,
+            max_h=max_h,
+            jpeg_quality=jpeg_q,
+            io_limit=self.io_limit_spin.value()
         )
         self.bind_and_start_thread()
 
@@ -1714,12 +2282,15 @@ class MainWindow(QMainWindow):
         self.bind_and_start_thread()
 
     def prepare_ui_for_start(self):
+        self.batch_start_time = time.time()
         self.start_btn_opt.setEnabled(False)
         self.start_btn_pack.setEnabled(False)
         self.tabs.setEnabled(False)
         self.abort_btn.setEnabled(True)
         self.log_table.setRowCount(0)
+        self.overall_progress.setValue(0)
         self.status_label.setText("Processing...")
+        self.eta_label.setText("Elapsed: 00:00 | ETA: Calculating...")
 
     def bind_and_start_thread(self):
         self.worker_thread.progress_signal.connect(self.on_progress)
@@ -1735,10 +2306,25 @@ class MainWindow(QMainWindow):
             self.worker_thread.abort()
             self.abort_btn.setEnabled(False)
 
+    @staticmethod
+    def _format_mm_ss(seconds: float) -> str:
+        secs = max(0, int(seconds))
+        hrs, rem = divmod(secs, 3600)
+        mins, s = divmod(rem, 60)
+        return f"{hrs:02d}:{mins:02d}:{s:02d}" if hrs > 0 else f"{mins:02d}:{s:02d}"
+
     def on_progress(self, done: int, total: int):
         self.overall_progress.setMaximum(total)
         self.overall_progress.setValue(done)
         self.status_label.setText(f"{done}/{total} Completed")
+        if self.batch_start_time and done > 0 and total > 0:
+            elapsed = max(0.1, time.time() - self.batch_start_time)
+            rate_per_min = (done / elapsed) * 60.0
+            remaining = max(0, total - done)
+            eta_sec = (elapsed / done) * remaining
+            self.eta_label.setText(
+                f"Elapsed: {self._format_mm_ss(elapsed)} | {rate_per_min:.1f} files/min | ETA: ~{self._format_mm_ss(eta_sec)}"
+            )
 
     def on_worker_update(self, worker_statuses: dict):
         for wid, info in worker_statuses.items():
@@ -1756,8 +2342,10 @@ class MainWindow(QMainWindow):
                     stage_item.setForeground(QColor("#f59e0b"))
                 elif "Resizing" in stage or stage == "Storing":
                     stage_item.setForeground(QColor("#a855f7"))
-                elif stage in ("Extracting", "Packing"):
+                elif stage in ("Extracting", "Packing", "Archiving"):
                     stage_item.setForeground(QColor("#eab308"))
+                elif stage == "Queued I/O":
+                    stage_item.setForeground(QColor("#38bdf8"))
                 self.worker_table.setItem(wid, 2, stage_item)
 
                 name_item = QTableWidgetItem(name)
@@ -1838,6 +2426,7 @@ class MainWindow(QMainWindow):
         self.tabs.setEnabled(True)
         self.abort_btn.setEnabled(False)
         self.status_label.setText("Idle")
+        self.eta_label.setText("Elapsed: 00:00 | ETA: --:--")
 
 if __name__ == "__main__":
     multiprocessing.freeze_support()
