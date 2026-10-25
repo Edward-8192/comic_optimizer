@@ -31,7 +31,7 @@ from PyQt6.QtWidgets import (
     QSplitter, QMessageBox, QFrame, QAbstractItemView, QTabWidget,
     QListWidget, QListWidgetItem, QComboBox
 )
-from PyQt6.QtGui import QDragEnterEvent, QDropEvent, QColor, QCloseEvent, QPainter, QFont
+from PyQt6.QtGui import QDragEnterEvent, QDropEvent, QColor, QCloseEvent, QPainter, QFont, QIcon
 
 # ==================== Core Configuration ====================
 MAX_WIDTH = 3840
@@ -373,7 +373,18 @@ def get_resource_path(relative_path: str) -> str:
     """取得 PyInstaller 打包後的內部資源路徑或開發時的本地路徑"""
     if hasattr(sys, '_MEIPASS'):
         return os.path.join(sys._MEIPASS, relative_path)
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    candidate = os.path.join(script_dir, relative_path)
+    if os.path.exists(candidate):
+        return candidate
     return os.path.join(os.path.abspath("."), relative_path)
+
+def get_app_icon() -> QIcon:
+    for icon_name in ("app_icon.png", "app_icon.icns"):
+        icon_path = get_resource_path(icon_name)
+        if os.path.exists(icon_path):
+            return QIcon(icon_path)
+    return QIcon()
 
 def find_7z_binary() -> str:
     bundled_7zz = get_resource_path("7zz")
@@ -1566,6 +1577,9 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Comic Optimizer & Fast Packer (macOS)")
+        app_icon = get_app_icon()
+        if not app_icon.isNull():
+            self.setWindowIcon(app_icon)
         self.resize(1340, 900)
         self.setAcceptDrops(True)
         self.setStyleSheet(MODERN_DARK_STYLESHEET)
@@ -1975,6 +1989,8 @@ class MainWindow(QMainWindow):
         self.log_table.setShowGrid(False)
         self.log_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.log_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.log_table.setVerticalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
+        self.log_table.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOn)
 
         l_header = self.log_table.horizontalHeader()
         l_header.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
@@ -2283,11 +2299,13 @@ class MainWindow(QMainWindow):
 
     def prepare_ui_for_start(self):
         self.batch_start_time = time.time()
+        self._rendered_log_count = 0
         self.start_btn_opt.setEnabled(False)
         self.start_btn_pack.setEnabled(False)
         self.tabs.setEnabled(False)
         self.abort_btn.setEnabled(True)
         self.log_table.setRowCount(0)
+        self.log_table.setHorizontalHeaderLabels(["Status", "Target Name", "Stats"])
         self.overall_progress.setValue(0)
         self.status_label.setText("Processing...")
         self.eta_label.setText("Elapsed: 00:00 | ETA: Calculating...")
@@ -2360,31 +2378,52 @@ class MainWindow(QMainWindow):
                 self.worker_table.setItem(wid, 4, detail_item)
 
     def on_log_update(self, logs: list):
-        display_logs = logs[-30:]
-        self.log_table.setRowCount(len(display_logs))
-        for row, item in enumerate(reversed(display_logs)):
-            if isinstance(item, (tuple, list)) and len(item) == 3:
-                tag, name, stat = item
-                status_item = QTableWidgetItem(f"[{tag}]")
-                status_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-                if tag == "OK":
-                    status_item.setForeground(QColor("#10b981"))
-                elif tag in ("FILE_ERR", "SYS_ERR"):
-                    status_item.setForeground(QColor("#ef4444"))
-                elif tag in ("SKIP", "INFO"):
-                    status_item.setForeground(QColor("#94a3b8"))
-                else:
-                    status_item.setForeground(QColor("#f59e0b"))
+        total_logs = len(logs)
+        rendered = getattr(self, "_rendered_log_count", 0)
+        if total_logs <= rendered:
+            return
 
-                name_item = QTableWidgetItem(name)
-                name_item.setToolTip(name)
+        v_bar = self.log_table.verticalScrollBar()
+        was_at_top = v_bar.value() <= 2
+        old_val = v_bar.value()
 
-                stat_item = QTableWidgetItem(f"({stat})")
-                stat_item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        new_items = logs[rendered:total_logs]
+        self.log_table.setUpdatesEnabled(False)
+        try:
+            for item in new_items:
+                if isinstance(item, (tuple, list)) and len(item) == 3:
+                    tag, name, stat = item
+                    self.log_table.insertRow(0)
 
-                self.log_table.setItem(row, 0, status_item)
-                self.log_table.setItem(row, 1, name_item)
-                self.log_table.setItem(row, 2, stat_item)
+                    status_item = QTableWidgetItem(f"[{tag}]")
+                    status_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                    if tag == "OK":
+                        status_item.setForeground(QColor("#10b981"))
+                    elif tag in ("FILE_ERR", "SYS_ERR"):
+                        status_item.setForeground(QColor("#ef4444"))
+                    elif tag in ("SKIP", "INFO"):
+                        status_item.setForeground(QColor("#94a3b8"))
+                    else:
+                        status_item.setForeground(QColor("#f59e0b"))
+
+                    name_item = QTableWidgetItem(name)
+                    name_item.setToolTip(name)
+
+                    stat_item = QTableWidgetItem(f"({stat})")
+                    stat_item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+
+                    self.log_table.setItem(0, 0, status_item)
+                    self.log_table.setItem(0, 1, name_item)
+                    self.log_table.setItem(0, 2, stat_item)
+            self._rendered_log_count = total_logs
+            self.log_table.setHorizontalHeaderLabels(["Status", f"Target Name ({total_logs})", "Stats"])
+        finally:
+            self.log_table.setUpdatesEnabled(True)
+
+        if was_at_top:
+            v_bar.setValue(0)
+        else:
+            v_bar.setValue(old_val + len(new_items) * 26)
 
     def on_error(self, message: str):
         QMessageBox.warning(self, "Error", message)
@@ -2432,6 +2471,11 @@ if __name__ == "__main__":
     multiprocessing.freeze_support()
     multiprocessing.set_start_method("spawn", force=True)
     app = QApplication(sys.argv)
+    app.setApplicationName("Comic Optimizer")
+    app.setApplicationDisplayName("Comic Optimizer")
+    icon = get_app_icon()
+    if not icon.isNull():
+        app.setWindowIcon(icon)
     window = MainWindow()
     window.show()
     sys.exit(app.exec())
