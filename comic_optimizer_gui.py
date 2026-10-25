@@ -6,8 +6,11 @@ os.environ["QT_LOGGING_RULES"] = "*.debug=false;qt.qpa.*=false"
 os.environ["OS_ACTIVITY_MODE"] = "disable"
 
 import re
+import csv
+import json
 import html
 import shutil
+import sqlite3
 import zipfile
 import subprocess
 import tempfile
@@ -28,7 +31,7 @@ from PyQt6.QtWidgets import (
     QSplitter, QMessageBox, QFrame, QAbstractItemView, QTabWidget,
     QListWidget, QListWidgetItem
 )
-from PyQt6.QtGui import QDragEnterEvent, QDropEvent, QColor
+from PyQt6.QtGui import QDragEnterEvent, QDropEvent, QColor, QCloseEvent
 
 # ==================== Core Configuration ====================
 MAX_WIDTH = 3840
@@ -57,6 +60,159 @@ SYSTEM_DIR_PREFIXES = (
 
 ARCHIVE_MAIN_EXT = '.cbz'
 ARCHIVE_OTHER_EXT = '.zip'
+
+def get_app_support_dir() -> Path:
+    custom_dir = os.environ.get("COMIC_OPTIMIZER_DATA_DIR")
+    if custom_dir:
+        return Path(custom_dir)
+    primary = Path.home() / "Library" / "Application Support" / "ComicOptimizer"
+    try:
+        primary.mkdir(parents=True, exist_ok=True)
+        return primary
+    except OSError:
+        fallback = Path(tempfile.gettempdir()) / "ComicOptimizer"
+        fallback.mkdir(parents=True, exist_ok=True)
+        return fallback
+
+APP_SUPPORT_DIR = get_app_support_dir()
+CONFIG_FILE_PATH = APP_SUPPORT_DIR / "config.json"
+HISTORY_DB_PATH = APP_SUPPORT_DIR / "history.db"
+
+def ensure_app_support_dir():
+    APP_SUPPORT_DIR.mkdir(parents=True, exist_ok=True)
+
+def load_app_config() -> dict:
+    ensure_app_support_dir()
+    if CONFIG_FILE_PATH.exists():
+        try:
+            return json.loads(CONFIG_FILE_PATH.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+    return {}
+
+def save_app_config(cfg: dict):
+    ensure_app_support_dir()
+    try:
+        CONFIG_FILE_PATH.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception:
+        pass
+
+class HistoryDatabase:
+    @staticmethod
+    def init_db():
+        ensure_app_support_dir()
+        with sqlite3.connect(HISTORY_DB_PATH) as conn:
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS conversion_history (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    timestamp TEXT NOT NULL,
+                    filename TEXT NOT NULL,
+                    source_dir TEXT NOT NULL,
+                    output_dir TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    page_count INTEGER DEFAULT 0,
+                    orig_bytes INTEGER DEFAULT 0,
+                    out_bytes INTEGER DEFAULT 0,
+                    saved_bytes INTEGER DEFAULT 0,
+                    duration_sec REAL DEFAULT 0.0
+                )
+            """)
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_history_ts ON conversion_history(id DESC)")
+            conn.commit()
+
+    @staticmethod
+    def add_record(
+        filename: str, source_dir: str, output_dir: str, status: str,
+        page_count: int, orig_bytes: int, out_bytes: int, duration_sec: float
+    ):
+        ensure_app_support_dir()
+        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        saved_bytes = (orig_bytes - out_bytes) if status == "SUCCESS" else 0
+        try:
+            with sqlite3.connect(HISTORY_DB_PATH, timeout=10.0) as conn:
+                conn.execute("""
+                    INSERT INTO conversion_history (
+                        timestamp, filename, source_dir, output_dir, status,
+                        page_count, orig_bytes, out_bytes, saved_bytes, duration_sec
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (
+                    ts, filename, source_dir, output_dir, status,
+                    page_count, orig_bytes, out_bytes, saved_bytes, duration_sec
+                ))
+                conn.commit()
+        except Exception:
+            pass
+
+    @staticmethod
+    def get_summary_stats() -> dict:
+        ensure_app_support_dir()
+        try:
+            with sqlite3.connect(HISTORY_DB_PATH) as conn:
+                cur = conn.cursor()
+                cur.execute("""
+                    SELECT
+                        COUNT(*),
+                        SUM(CASE WHEN status = 'SUCCESS' THEN 1 ELSE 0 END),
+                        SUM(CASE WHEN status = 'FILE_ERR' THEN 1 ELSE 0 END),
+                        SUM(CASE WHEN status = 'ERROR' THEN 1 ELSE 0 END),
+                        SUM(CASE WHEN status = 'SUCCESS' THEN page_count ELSE 0 END),
+                        SUM(CASE WHEN status = 'SUCCESS' THEN orig_bytes ELSE 0 END),
+                        SUM(CASE WHEN status = 'SUCCESS' THEN out_bytes ELSE 0 END),
+                        SUM(CASE WHEN status = 'SUCCESS' THEN saved_bytes ELSE 0 END)
+                    FROM conversion_history
+                """)
+                row = cur.fetchone()
+                if row:
+                    return {
+                        "total_count": row[0] or 0,
+                        "success_count": row[1] or 0,
+                        "corrupted_count": row[2] or 0,
+                        "error_count": row[3] or 0,
+                        "total_pages": row[4] or 0,
+                        "total_orig_bytes": row[5] or 0,
+                        "total_out_bytes": row[6] or 0,
+                        "total_saved_bytes": row[7] or 0,
+                    }
+        except Exception:
+            pass
+        return {
+            "total_count": 0, "success_count": 0, "corrupted_count": 0, "error_count": 0,
+            "total_pages": 0, "total_orig_bytes": 0, "total_out_bytes": 0, "total_saved_bytes": 0
+        }
+
+    @staticmethod
+    def query_records(search_text: str = "", limit: int = 1000) -> list:
+        ensure_app_support_dir()
+        try:
+            with sqlite3.connect(HISTORY_DB_PATH) as conn:
+                cur = conn.cursor()
+                if search_text.strip():
+                    kw = f"%{search_text.strip()}%"
+                    cur.execute("""
+                        SELECT timestamp, filename, status, page_count, orig_bytes, out_bytes, saved_bytes, duration_sec, source_dir, output_dir
+                        FROM conversion_history
+                        WHERE filename LIKE ? OR source_dir LIKE ? OR status LIKE ?
+                        ORDER BY id DESC LIMIT ?
+                    """, (kw, kw, kw, limit))
+                else:
+                    cur.execute("""
+                        SELECT timestamp, filename, status, page_count, orig_bytes, out_bytes, saved_bytes, duration_sec, source_dir, output_dir
+                        FROM conversion_history
+                        ORDER BY id DESC LIMIT ?
+                    """, (limit,))
+                return cur.fetchall()
+        except Exception:
+            return []
+
+    @staticmethod
+    def clear_all():
+        ensure_app_support_dir()
+        try:
+            with sqlite3.connect(HISTORY_DB_PATH) as conn:
+                conn.execute("DELETE FROM conversion_history")
+                conn.commit()
+        except Exception:
+            pass
 
 def get_resource_path(relative_path: str) -> str:
     """取得 PyInstaller 打包後的內部資源路徑或開發時的本地路徑"""
@@ -319,7 +475,7 @@ def create_zip_store(target_archive: Path, file_pairs: list, root_folder_name: s
                 top_dirs.add(parts[0])
             else:
                 has_root_files = True
-        if has_root_files or len(top_dirs) > 1:
+        if has_root_files or len(top_dirs) != 1 or next(iter(top_dirs)) != root_folder_name:
             needs_wrapper = True
 
     with zipfile.ZipFile(target_archive, 'w', compression=zipfile.ZIP_STORED) as zf:
@@ -392,7 +548,7 @@ def execute_pipeline(
 
         success, reason = extract_archive_stream(archive_path, extracted_dir, update_extract_progress)
         if not success:
-            return False, reason, 0
+            return False, reason, 0, 0
 
         status_dict[worker_id] = {
             "tier": tier_tag, "stage": "Scanning", "name": archive_path.name,
@@ -416,7 +572,7 @@ def execute_pipeline(
                     media_files.append((file_path, str(rel_path)))
 
         if not static_images and not animated_images and not media_files:
-            return False, "NO_VALID_FILES", 0
+            return False, "NO_VALID_FILES", 0, 0
 
         total_imgs = len(static_images)
         processed_images = []
@@ -479,19 +635,29 @@ def execute_pipeline(
             "tier": tier_tag, "stage": "Packaging", "name": archive_path.name,
             "progress": 0.95, "detail": "STORE Write"
         }
+        out_bytes = 0
         if processed_images:
-            create_zip_store(resized_dir / f"{stem_name}{ARCHIVE_MAIN_EXT}", processed_images)
+            main_arc = resized_dir / f"{stem_name}{ARCHIVE_MAIN_EXT}"
+            create_zip_store(main_arc, processed_images)
+            if main_arc.exists():
+                out_bytes += main_arc.stat().st_size
         if animated_images:
-            create_zip_store(anim_dir / f"{stem_name}-Animated{ARCHIVE_OTHER_EXT}", animated_images, root_folder_name=f"{stem_name}-Animated")
+            anim_arc = anim_dir / f"{stem_name}-Animated{ARCHIVE_OTHER_EXT}"
+            create_zip_store(anim_arc, animated_images, root_folder_name=f"{stem_name}-Animated")
+            if anim_arc.exists():
+                out_bytes += anim_arc.stat().st_size
         if media_files:
-            create_zip_store(media_dir / f"{stem_name}-Media{ARCHIVE_OTHER_EXT}", media_files, root_folder_name=f"{stem_name}-Media")
+            media_arc = media_dir / f"{stem_name}-Media{ARCHIVE_OTHER_EXT}"
+            create_zip_store(media_arc, media_files, root_folder_name=f"{stem_name}-Media")
+            if media_arc.exists():
+                out_bytes += media_arc.stat().st_size
 
     status_dict[worker_id] = {
         "tier": tier_tag, "stage": "Archiving", "name": archive_path.name,
         "progress": 1.0, "detail": "Moving"
     }
     safe_move_file(archive_path, original_files_dir)
-    return True, "SUCCESS", len(static_images)
+    return True, "SUCCESS", len(static_images), out_bytes
 
 def worker_task(
     archive_path_str: str, target_tier: str, reserved_mb: float,
@@ -507,6 +673,11 @@ def worker_task(
     error_dir = Path(error_dir_str)
     file_err_dir = Path(file_err_dir_str)
 
+    try:
+        orig_bytes = archive_path.stat().st_size
+    except Exception:
+        orig_bytes = 0
+
     current_allocated_ram, ram_budget_mb, ram_lock = ram_manager_tuple
     tier_tag = "RAM" if target_tier == "RAM" else "SSD"
     temp_target_dir = str(RAM_DISK_MOUNT) if target_tier == "RAM" else None
@@ -514,7 +685,7 @@ def worker_task(
     start_task_time = time.time()
     clean_name = sanitize_log_text(archive_path.name)
     try:
-        ok, reason, img_count = execute_pipeline(
+        ok, reason, img_count, out_bytes = execute_pipeline(
             archive_path, resized_dir, anim_dir, media_dir, original_files_dir,
             temp_target_dir, tier_tag, worker_id, status_dict, cpu_token_manager
         )
@@ -522,7 +693,7 @@ def worker_task(
         if not ok and reason == "NO_SPACE" and temp_target_dir is not None:
             recent_logs.append(("WARN", clean_name, "RAM limit -> SSD"))
             tier_tag = "SSD"
-            ok, reason, img_count = execute_pipeline(
+            ok, reason, img_count, out_bytes = execute_pipeline(
                 archive_path, resized_dir, anim_dir, media_dir, original_files_dir,
                 None, tier_tag, worker_id, status_dict, cpu_token_manager
             )
@@ -530,19 +701,19 @@ def worker_task(
                 safe_move_file(archive_path, error_dir)
                 recent_logs.append(("SYS_ERR", clean_name, "Retry Failed"))
                 status_dict[worker_id] = {"tier": tier_tag, "stage": "Idle", "name": "-", "progress": 0.0, "detail": ""}
-                return archive_path_str, "ERROR", 0
+                return archive_path_str, "ERROR", time.time() - start_task_time, 0, orig_bytes, 0
 
         elif not ok and reason in ("CORRUPTED", "NO_VALID_FILES"):
             safe_move_file(archive_path, file_err_dir)
             recent_logs.append(("FILE_ERR", clean_name, "Corrupted File"))
             status_dict[worker_id] = {"tier": tier_tag, "stage": "Idle", "name": "-", "progress": 0.0, "detail": ""}
-            return archive_path_str, "FILE_ERR", 0
+            return archive_path_str, "FILE_ERR", time.time() - start_task_time, 0, orig_bytes, 0
 
         elif not ok:
             safe_move_file(archive_path, error_dir)
             recent_logs.append(("SYS_ERR", clean_name, "Execution Error"))
             status_dict[worker_id] = {"tier": tier_tag, "stage": "Idle", "name": "-", "progress": 0.0, "detail": ""}
-            return archive_path_str, "ERROR", 0
+            return archive_path_str, "ERROR", time.time() - start_task_time, 0, orig_bytes, 0
     finally:
         if target_tier == "RAM" and reserved_mb > 0:
             with ram_lock:
@@ -551,7 +722,7 @@ def worker_task(
     total_cost = time.time() - start_task_time
     recent_logs.append(("OK", clean_name, f"{total_cost:.1f}s, {img_count}P"))
     status_dict[worker_id] = {"tier": tier_tag, "stage": "Idle", "name": "-", "progress": 0.0, "detail": ""}
-    return archive_path_str, "SUCCESS", total_cost
+    return archive_path_str, "SUCCESS", total_cost, img_count, orig_bytes, out_bytes
 
 def pack_folder_worker(folder_path_str: str, out_ext: str, worker_id: int, status_dict, recent_logs, move_to_orig_dir_str: str = None):
     folder_path = Path(folder_path_str)
@@ -707,6 +878,8 @@ class OptimizerThread(QThread):
         fail_err_count = 0
         corrupted_count = 0
         done_total = 0
+        session_orig_bytes = 0
+        session_out_bytes = 0
 
         available_workers = set(range(num_workers))
         active_futures = {}
@@ -716,16 +889,35 @@ class OptimizerThread(QThread):
                 while (pending_queue or active_futures) and not self.is_aborted:
                     done_futures = [f for f in active_futures if f.done()]
                     for f in done_futures:
-                        worker_id = active_futures.pop(f)
+                        task_meta = active_futures.pop(f)
+                        worker_id = task_meta["wid"]
+                        src_root_str = task_meta["src_root"]
+                        dest_root_str = task_meta["dest_root"]
                         available_workers.add(worker_id)
                         done_total += 1
                         try:
-                            arch_path_done, result_code, _ = f.result()
-                            if result_code == "SUCCESS": success_count += 1
+                            arch_path_done, result_code, cost_sec, page_cnt, f_orig_b, f_out_b = f.result()
+                            arch_name = Path(arch_path_done).name
+                            if result_code == "SUCCESS":
+                                success_count += 1
+                                session_orig_bytes += f_orig_b
+                                session_out_bytes += f_out_b
                             elif result_code == "FILE_ERR":
                                 corrupted_count += 1
                                 file_err_stems.append(Path(arch_path_done).stem)
-                            else: fail_err_count += 1
+                            else:
+                                fail_err_count += 1
+
+                            HistoryDatabase.add_record(
+                                filename=arch_name,
+                                source_dir=src_root_str,
+                                output_dir=dest_root_str,
+                                status=result_code,
+                                page_count=page_cnt,
+                                orig_bytes=f_orig_b,
+                                out_bytes=f_out_b,
+                                duration_sec=cost_sec
+                            )
                         except Exception:
                             fail_err_count += 1
                         self.progress_signal.emit(done_total, len(archive_items))
@@ -785,7 +977,11 @@ class OptimizerThread(QThread):
                                 str(original_files_dir), str(error_dir), str(file_err_dir),
                                 worker_id, worker_statuses, recent_logs, ram_manager_tuple, cpu_token_manager
                             )
-                            active_futures[f] = worker_id
+                            active_futures[f] = {
+                                "wid": worker_id,
+                                "src_root": str(src_root),
+                                "dest_root": str(dest_root)
+                            }
                         else:
                             break
 
@@ -832,22 +1028,12 @@ class OptimizerThread(QThread):
             except Exception:
                 pass
 
-        # 空間統計計算
-        total_orig_bytes = sum(get_dir_size_bytes(s / f"OriginalFiles-{today_str}") for s in self.source_dirs)
+        # 空間統計計算 (以本次執行實際處理的檔案大小為準)
+        total_orig_bytes = session_orig_bytes
+        total_out_bytes = session_out_bytes
         if self.global_output_dir:
-            total_out_bytes = (
-                get_dir_size_bytes(self.global_output_dir / f"Resized-{today_str}") +
-                get_dir_size_bytes(self.global_output_dir / f"Animated-{today_str}") +
-                get_dir_size_bytes(self.global_output_dir / f"Media-{today_str}")
-            )
             out_loc_desc = str(self.global_output_dir)
         else:
-            total_out_bytes = sum(
-                get_dir_size_bytes(s / f"Resized-{today_str}") +
-                get_dir_size_bytes(s / f"Animated-{today_str}") +
-                get_dir_size_bytes(s / f"Media-{today_str}")
-                for s in self.source_dirs
-            )
             out_loc_desc = "Respective source folders"
 
         summary_payload = {
@@ -981,6 +1167,8 @@ class DropLineEdit(QLineEdit):
 
 class DropListWidget(QListWidget):
     """支援直接拖曳多個資料夾加入清單的自訂 ListWidget"""
+    items_changed_signal = pyqtSignal()
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setAcceptDrops(True)
@@ -994,6 +1182,7 @@ class DropListWidget(QListWidget):
             event.acceptProposedAction()
 
     def dropEvent(self, event: QDropEvent):
+        added = False
         for url in event.mimeData().urls():
             local_path = url.toLocalFile()
             if os.path.isdir(local_path):
@@ -1001,6 +1190,9 @@ class DropListWidget(QListWidget):
                 existing = [self.item(i).text() for i in range(self.count())]
                 if local_path not in existing:
                     self.addItem(local_path)
+                    added = True
+        if added:
+            self.items_changed_signal.emit()
 
 class MainWindow(QMainWindow):
     def __init__(self):
@@ -1010,7 +1202,14 @@ class MainWindow(QMainWindow):
         self.setAcceptDrops(True)
         self.worker_thread = None
         self.num_workers = max(1, os.cpu_count() - 1)
+        HistoryDatabase.init_db()
         self.init_ui()
+        self.load_user_settings()
+        self.refresh_history_view()
+
+    def closeEvent(self, event: QCloseEvent):
+        self.save_user_settings()
+        super().closeEvent(event)
 
     def dragEnterEvent(self, event: QDragEnterEvent):
         if event.mimeData().hasUrls():
@@ -1022,14 +1221,20 @@ class MainWindow(QMainWindow):
             if os.path.isdir(local_path):
                 if self.tabs.currentIndex() == 0:
                     self.add_source_folder(local_path)
-                else:
+                elif self.tabs.currentIndex() == 1:
                     self.path_input_pack.setText(local_path)
+                    self.save_user_settings()
 
     def add_source_folder(self, path_str: str):
         existing = [self.sources_list.item(i).text() for i in range(self.sources_list.count())]
         if path_str not in existing:
             self.sources_list.addItem(path_str)
         self.update_sources_count_label()
+        self.save_user_settings()
+
+    def on_sources_list_dropped(self):
+        self.update_sources_count_label()
+        self.save_user_settings()
 
     def update_sources_count_label(self):
         cnt = self.sources_list.count()
@@ -1055,6 +1260,7 @@ class MainWindow(QMainWindow):
         self.sources_list = DropListWidget()
         self.sources_list.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         self.sources_list.setStyleSheet("QListWidget { font-size: 0.9rem; }")
+        self.sources_list.items_changed_signal.connect(self.on_sources_list_dropped)
         
         src_btn_layout = QVBoxLayout()
         add_src_btn = QPushButton("Add Folder...")
@@ -1080,6 +1286,7 @@ class MainWindow(QMainWindow):
         row_out = QHBoxLayout()
         self.path_output_opt = DropLineEdit()
         self.path_output_opt.setPlaceholderText("Output destination (Optional, leave empty to save into each source folder)...")
+        self.path_output_opt.textChanged.connect(lambda _: self.save_user_settings())
         browse_out_btn = QPushButton("Browse...")
         browse_out_btn.clicked.connect(lambda: self.browse_folder(self.path_output_opt))
         clear_out_btn = QPushButton("Clear")
@@ -1097,9 +1304,11 @@ class MainWindow(QMainWindow):
         self.ram_spin.setRange(0, 128)
         self.ram_spin.setValue(rec_ram)
         self.ram_spin.setSuffix(" GB")
+        self.ram_spin.valueChanged.connect(lambda _: self.save_user_settings())
 
         self.strict_check = QCheckBox("Strict RAM")
         self.strict_check.setChecked(True)
+        self.strict_check.toggled.connect(lambda _: self.save_user_settings())
 
         self.start_btn_opt = QPushButton("Start Optimizer")
         self.start_btn_opt.setStyleSheet("background-color: #059669; color: white; font-weight: bold; padding: 6px 16px;")
@@ -1121,11 +1330,13 @@ class MainWindow(QMainWindow):
 
         self.path_input_pack = DropLineEdit()
         self.path_input_pack.setPlaceholderText("Target folder whose subfolders will be packed to zip (zip -0 -r)...")
+        self.path_input_pack.textChanged.connect(lambda _: self.save_user_settings())
         browse_btn_pack = QPushButton("Browse...")
         browse_btn_pack.clicked.connect(lambda: self.browse_folder(self.path_input_pack))
 
         self.cbz_format_check = QCheckBox("Output .cbz instead of .zip")
         self.cbz_format_check.setChecked(False)
+        self.cbz_format_check.toggled.connect(lambda _: self.save_user_settings())
 
         self.start_btn_pack = QPushButton("Pack Subfolders")
         self.start_btn_pack.setStyleSheet("background-color: #2563eb; color: white; font-weight: bold; padding: 6px 14px;")
@@ -1137,6 +1348,83 @@ class MainWindow(QMainWindow):
         layout_pack.addWidget(self.cbz_format_check)
         layout_pack.addWidget(self.start_btn_pack)
         self.tabs.addTab(tab_pack, "Quick Folder Packer (Store zip -0)")
+
+        # ---- Tab 3: History & Statistics ----
+        tab_hist = QWidget()
+        layout_hist = QVBoxLayout(tab_hist)
+        layout_hist.setContentsMargins(8, 8, 8, 8)
+        layout_hist.setSpacing(8)
+
+        # 統計摘要列
+        stats_frame = QFrame()
+        stats_frame.setStyleSheet("QFrame { background-color: #1e293b; border-radius: 6px; padding: 6px; }")
+        stats_layout = QHBoxLayout(stats_frame)
+        stats_layout.setContentsMargins(10, 6, 10, 6)
+
+        self.stat_files_label = QLabel("Processed: 0 OK (0 Pages)")
+        self.stat_files_label.setStyleSheet("font-weight: bold; color: #f8fafc; font-size: 0.92rem;")
+        self.stat_orig_label = QLabel("Original: 0 B")
+        self.stat_orig_label.setStyleSheet("font-weight: bold; color: #94a3b8; font-size: 0.92rem;")
+        self.stat_out_label = QLabel("Optimized: 0 B")
+        self.stat_out_label.setStyleSheet("font-weight: bold; color: #38bdf8; font-size: 0.92rem;")
+        self.stat_saved_label = QLabel("Total Saved: 0 B (▼ 0.0%)")
+        self.stat_saved_label.setStyleSheet("font-weight: bold; color: #10b981; font-size: 0.95rem;")
+
+        stats_layout.addWidget(self.stat_files_label)
+        stats_layout.addStretch()
+        stats_layout.addWidget(self.stat_orig_label)
+        stats_layout.addStretch()
+        stats_layout.addWidget(self.stat_out_label)
+        stats_layout.addStretch()
+        stats_layout.addWidget(self.stat_saved_label)
+        layout_hist.addWidget(stats_frame)
+
+        # 搜尋與管理列
+        hist_ctrl_layout = QHBoxLayout()
+        self.hist_search_input = QLineEdit()
+        self.hist_search_input.setPlaceholderText("Search history by filename, folder, or status (SUCCESS / FILE_ERR)...")
+        self.hist_search_input.textChanged.connect(lambda _: self.refresh_history_view())
+
+        refresh_hist_btn = QPushButton("Refresh")
+        refresh_hist_btn.clicked.connect(self.refresh_history_view)
+        export_csv_btn = QPushButton("Export CSV...")
+        export_csv_btn.clicked.connect(self.export_history_csv)
+        clear_hist_btn = QPushButton("Clear History")
+        clear_hist_btn.setStyleSheet("color: #f87171;")
+        clear_hist_btn.clicked.connect(self.clear_history_records)
+
+        hist_ctrl_layout.addWidget(QLabel("Filter:"))
+        hist_ctrl_layout.addWidget(self.hist_search_input, stretch=2)
+        hist_ctrl_layout.addWidget(refresh_hist_btn)
+        hist_ctrl_layout.addWidget(export_csv_btn)
+        hist_ctrl_layout.addWidget(clear_hist_btn)
+        layout_hist.addLayout(hist_ctrl_layout)
+
+        # 歷史明細表格
+        self.history_table = QTableWidget(0, 8)
+        self.history_table.setHorizontalHeaderLabels([
+            "Timestamp", "Filename", "Status", "Pages",
+            "Original Size", "Optimized Size", "Saved (%)", "Duration"
+        ])
+        self.history_table.verticalHeader().setVisible(False)
+        self.history_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.history_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.history_table.setMinimumHeight(180)
+
+        h_header = self.history_table.horizontalHeader()
+        h_header.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
+        self.history_table.setColumnWidth(0, 145)
+        self.history_table.setColumnWidth(1, 380)
+        self.history_table.setColumnWidth(2, 85)
+        self.history_table.setColumnWidth(3, 65)
+        self.history_table.setColumnWidth(4, 110)
+        self.history_table.setColumnWidth(5, 110)
+        self.history_table.setColumnWidth(6, 150)
+        self.history_table.setColumnWidth(7, 80)
+        layout_hist.addWidget(self.history_table)
+
+        self.tabs.addTab(tab_hist, "History & Statistics (All-Time)")
+        self.tabs.currentChanged.connect(self.on_tab_changed)
 
         top_bar_layout = QHBoxLayout()
         top_bar_layout.addWidget(self.tabs, stretch=1)
@@ -1211,15 +1499,173 @@ class MainWindow(QMainWindow):
         for item in self.sources_list.selectedItems():
             self.sources_list.takeItem(self.sources_list.row(item))
         self.update_sources_count_label()
+        self.save_user_settings()
 
     def clear_all_sources(self):
         self.sources_list.clear()
         self.update_sources_count_label()
+        self.save_user_settings()
 
     def browse_folder(self, target_line_edit: QLineEdit):
         folder = QFileDialog.getExistingDirectory(self, "Select Folder")
         if folder:
             target_line_edit.setText(folder)
+            self.save_user_settings()
+
+    def on_tab_changed(self, idx: int):
+        if idx == 2:
+            self.refresh_history_view()
+        self.save_user_settings()
+
+    def load_user_settings(self):
+        self._loading_settings = True
+        try:
+            cfg = load_app_config()
+            if not cfg:
+                return
+            for src in cfg.get("source_dirs", []):
+                if isinstance(src, str) and src.strip():
+                    existing = [self.sources_list.item(i).text() for i in range(self.sources_list.count())]
+                    if src not in existing:
+                        self.sources_list.addItem(src)
+            self.update_sources_count_label()
+
+            if "output_dir" in cfg:
+                self.path_output_opt.setText(str(cfg["output_dir"]))
+            if "ram_gb" in cfg and isinstance(cfg["ram_gb"], int):
+                self.ram_spin.setValue(max(0, min(128, cfg["ram_gb"])))
+            if "strict_ram" in cfg:
+                self.strict_check.setChecked(bool(cfg["strict_ram"]))
+            if "pack_target_dir" in cfg:
+                self.path_input_pack.setText(str(cfg["pack_target_dir"]))
+            if "pack_cbz_format" in cfg:
+                self.cbz_format_check.setChecked(bool(cfg["pack_cbz_format"]))
+            if "current_tab_index" in cfg and isinstance(cfg["current_tab_index"], int):
+                tab_idx = cfg["current_tab_index"]
+                if 0 <= tab_idx < self.tabs.count():
+                    self.tabs.setCurrentIndex(tab_idx)
+        finally:
+            self._loading_settings = False
+
+    def save_user_settings(self):
+        if getattr(self, "_loading_settings", False):
+            return
+        cfg = {
+            "source_dirs": [self.sources_list.item(i).text() for i in range(self.sources_list.count())],
+            "output_dir": self.path_output_opt.text().strip(),
+            "ram_gb": self.ram_spin.value(),
+            "strict_ram": self.strict_check.isChecked(),
+            "pack_target_dir": self.path_input_pack.text().strip(),
+            "pack_cbz_format": self.cbz_format_check.isChecked(),
+            "current_tab_index": self.tabs.currentIndex(),
+        }
+        save_app_config(cfg)
+
+    def refresh_history_view(self):
+        stats = HistoryDatabase.get_summary_stats()
+        ok_cnt = stats["success_count"]
+        err_cnt = stats["corrupted_count"] + stats["error_count"]
+        pages = stats["total_pages"]
+        orig_b = stats["total_orig_bytes"]
+        out_b = stats["total_out_bytes"]
+        saved_b = stats["total_saved_bytes"]
+        saved_pct = (saved_b / orig_b * 100.0) if orig_b > 0 else 0.0
+
+        self.stat_files_label.setText(f"Processed: {ok_cnt:,} OK / {err_cnt:,} Err ({pages:,} Pages)")
+        self.stat_orig_label.setText(f"Original: {format_bytes(orig_b)}")
+        self.stat_out_label.setText(f"Optimized: {format_bytes(out_b)}")
+        self.stat_saved_label.setText(f"Total Saved: {format_bytes(max(0, saved_b))} (▼ {saved_pct:.1f}%)")
+
+        search_kw = self.hist_search_input.text() if hasattr(self, "hist_search_input") else ""
+        rows = HistoryDatabase.query_records(search_kw, limit=1000)
+        self.history_table.setRowCount(len(rows))
+
+        for r_idx, row in enumerate(rows):
+            ts, fname, status, page_cnt, f_orig, f_out, f_saved, dur, src_d, out_d = row
+
+            ts_item = QTableWidgetItem(ts)
+            ts_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+
+            fn_item = QTableWidgetItem(fname)
+            fn_item.setToolTip(f"File: {fname}\nSource: {src_d}\nOutput: {out_d}")
+
+            st_item = QTableWidgetItem(status)
+            st_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            if status == "SUCCESS":
+                st_item.setForeground(QColor("#10b981"))
+            else:
+                st_item.setForeground(QColor("#ef4444"))
+
+            pg_item = QTableWidgetItem(f"{page_cnt}P" if status == "SUCCESS" else "-")
+            pg_item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+
+            orig_item = QTableWidgetItem(format_bytes(f_orig) if f_orig > 0 else "-")
+            orig_item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+
+            out_item = QTableWidgetItem(format_bytes(f_out) if status == "SUCCESS" else "-")
+            out_item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+
+            if status == "SUCCESS" and f_orig > 0:
+                pct = (f_saved / f_orig) * 100.0
+                sign = "▼" if f_saved >= 0 else "▲"
+                sav_str = f"{format_bytes(abs(f_saved))} ({sign} {abs(pct):.1f}%)"
+                sav_item = QTableWidgetItem(sav_str)
+                sav_item.setForeground(QColor("#10b981") if f_saved >= 0 else QColor("#f59e0b"))
+            else:
+                sav_item = QTableWidgetItem("-")
+            sav_item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+
+            dur_item = QTableWidgetItem(f"{dur:.1f}s")
+            dur_item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+
+            self.history_table.setItem(r_idx, 0, ts_item)
+            self.history_table.setItem(r_idx, 1, fn_item)
+            self.history_table.setItem(r_idx, 2, st_item)
+            self.history_table.setItem(r_idx, 3, pg_item)
+            self.history_table.setItem(r_idx, 4, orig_item)
+            self.history_table.setItem(r_idx, 5, out_item)
+            self.history_table.setItem(r_idx, 6, sav_item)
+            self.history_table.setItem(r_idx, 7, dur_item)
+
+    def export_history_csv(self):
+        rows = HistoryDatabase.query_records(self.hist_search_input.text(), limit=100000)
+        if not rows:
+            QMessageBox.information(self, "Export CSV", "No history records to export.")
+            return
+        default_name = str(Path.home() / f"comic_optimizer_history_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv")
+        file_path, _ = QFileDialog.getSaveFileName(self, "Export History to CSV", default_name, "CSV Files (*.csv)")
+        if not file_path:
+            return
+        try:
+            with open(file_path, "w", newline="", encoding="utf-8-sig") as f:
+                writer = csv.writer(f)
+                writer.writerow([
+                    "Timestamp", "Filename", "Status", "Pages",
+                    "Original Bytes", "Optimized Bytes", "Saved Bytes", "Saved (%)",
+                    "Duration (s)", "Source Directory", "Output Directory"
+                ])
+                for r in rows:
+                    ts, fname, status, page_cnt, f_orig, f_out, f_saved, dur, src_d, out_d = r
+                    pct = f"{(f_saved / f_orig * 100.0):.2f}%" if (status == "SUCCESS" and f_orig > 0) else "0.00%"
+                    writer.writerow([
+                        ts, fname, status, page_cnt,
+                        f_orig, f_out, f_saved, pct,
+                        f"{dur:.2f}", src_d, out_d
+                    ])
+            QMessageBox.information(self, "Export Complete", f"Exported {len(rows)} records to:\n{file_path}")
+        except Exception as e:
+            QMessageBox.warning(self, "Export Failed", f"Failed to write CSV:\n{e}")
+
+    def clear_history_records(self):
+        reply = QMessageBox.question(
+            self, "Clear History",
+            "Are you sure you want to permanently clear all conversion history and all-time statistics?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No
+        )
+        if reply == QMessageBox.StandardButton.Yes:
+            HistoryDatabase.clear_all()
+            self.refresh_history_view()
 
     def update_ram_usage(self):
         text, _ = get_ram_disk_usage()
@@ -1242,6 +1688,7 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Input Error", "The specified output directory does not exist.")
             return
 
+        self.save_user_settings()
         self.prepare_ui_for_start()
         self.worker_thread = OptimizerThread(
             source_dirs_list=source_dirs,
@@ -1257,6 +1704,7 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Input Error", "Please provide a valid directory containing subfolders.")
             return
 
+        self.save_user_settings()
         out_ext = ".cbz" if self.cbz_format_check.isChecked() else ".zip"
         self.prepare_ui_for_start()
         self.worker_thread = FolderPackerThread(
@@ -1356,6 +1804,7 @@ class MainWindow(QMainWindow):
 
     def on_finished(self, summary: dict):
         self.reset_ui()
+        self.refresh_history_view()
         mode = summary.get("mode")
         hrs, rem = divmod(int(summary["total_time"]), 3600)
         mins, secs = divmod(rem, 60)
