@@ -10,9 +10,9 @@ A high-performance comic/manga archive optimizer and folder packer built for mac
 1. **Multiprocessing, Abort Safety & System Stability**:
    - macOS uses the `spawn` start method. Always keep `multiprocessing.freeze_support()` and `multiprocessing.set_start_method("spawn", force=True)` in `__main__` for PyInstaller compatibility.
    - Reserve 1 physical/logical CPU core for macOS, the GUI main thread, and the Multiprocessing Manager (`num_workers = max(1, os.cpu_count() - 1)`).
-   - Heavy tasks must run in `QThread` (`OptimizerThread`, `FolderPackerThread`) via `ProcessPoolExecutor` to prevent freezing the GUI.
+   - Heavy tasks must run in `QThread` (`OptimizerThread`, `FolderPackerThread`, `ArchiveUnpackerThread`) via `ProcessPoolExecutor` to prevent freezing the GUI.
    - **Never use `with ProcessPoolExecutor(...) as executor:`** (which calls `shutdown(wait=True)` on exit and blocks Abort while background tasks keep running). Always manage `executor` explicitly and call `terminate_executor_immediately(executor, futures)` on abort (`shutdown(wait=False, cancel_futures=True)` + `pkill -9 -P <pid>` + `p.kill()`), alongside the shared cooperative `abort_flag = manager.Value('b', False)`.
-   - `pack_folder_worker` must write to a temporary `.packing_<name>.tmp` file first and only rename to the final archive upon full completion so aborting never leaves half-written archives or moves the source folder prematurely. Aborted tasks in `worker_task` must return `"ABORTED"` and leave the original archive untouched (never moving it to `Error-` or `FileErr-`).
+   - `pack_folder_worker` must write to a temporary `.packing_<name>.tmp` file first and only rename to the final archive upon full completion. Similarly, `unpack_archive_worker` must extract to `.unpacking_<stem>_<wid>.tmp` inside `Unzipped-YYYY-MM-DD`, clean up leftover `.unpacking_*.tmp` on abort, and only rename to `Unzipped-YYYY-MM-DD/<stem>/` upon completion. Aborted tasks must return `"ABORTED"` and leave the original archive/folder untouched (never moving it to `Error-` or `FileErr-`).
 2. **CPU Token Pool (Atomic Token Management)**:
    - System cores are managed atomically via `cpu_token_manager = (allocated_cpu_tokens, cpu_token_lock)` to prevent CPU over-subscription when multiple workers resize images simultaneously.
    - Dynamic micro-batching (`CHUNK_SIZE = 24`) borrows cores from both `"Idle"` and `"Queued I/O"` workers dynamically.
@@ -28,10 +28,11 @@ A high-performance comic/manga archive optimizer and folder packer built for mac
    - **Dual-Check Strict RAM**:
      - Checks both `current_allocated_ram` budget and real physical free space (`get_ram_disk_free_mb()`).
      - When `strict_ram=True`, `NO_SPACE` must **never** silently fall back to SSD; instead it cleans up the temp directory, releases reserved RAM, and returns `"RETRY_RAM"` to re-queue at the head of `pending_queue` (falling back to SSD only if a single archive fails 3 times because its individual size exceeds the entire RAM Disk).
-5. **Directory Isolation & Wrapper Folder Rules**:
-   - Never scan or re-pack directories starting with `SYSTEM_DIR_PREFIXES` (`Resized-`, `Comic-`, `Animated-`, `Media-`, `OriginalFiles-`, `Processed-`, `FileErr-`, `Error-`).
-   - Archived original files must always stay in their original source folder under `OriginalFiles-YYYY-MM-DD`.
+5. **Directory Isolation, Wrapper Folder & Smart Flatten Rules**:
+   - Never scan or re-pack directories starting with `SYSTEM_DIR_PREFIXES` (`Resized-`, `Comic-`, `Animated-`, `Media-`, `OriginalFiles-`, `Processed-`, `FileErr-`, `Error-`, `Unzipped-`), unless the user explicitly sets an `Unzipped-YYYY-MM-DD` directory itself as the Target Folder in `Pack & Unpack Studio` to pack its child subfolders.
+   - Archived original files/subfolders must always stay in their original source folder under `OriginalFiles-YYYY-MM-DD`.
    - `create_zip_store` must wrap files under `root_folder_name` whenever `root_folder_name` is specified (unless all files already share a single top-level directory named `root_folder_name`).
+   - `unpack_archive_worker` supports `smart_flatten=True` (unwrapping redundant single-folder nesting in `O(1)` via rename and removing `__MACOSX`, `.DS_Store`, `._*` junk) so every archive extracts cleanly to `Unzipped-YYYY-MM-DD/<ArchiveStem>/`.
 6. **Zero-I/O Pre-flight & CJK Log Safety**:
    - Use Central Directory for `.zip`/`.cbz` (`* 1.08` safety buffer) and `size * 1.30` estimation for `.rar`/`.cbr`/`.7z`.
    - `sanitize_log_text` must only strip supplementary-plane colorful emojis (`U+1F1E0..U+1FAFF`) and must preserve all CJK characters, Kana, and full-width punctuation.

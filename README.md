@@ -24,6 +24,11 @@
     - **影音媒體**（`.mp4`, `.mkv`, `.mov`, `.mp3`, `.flac` 等）➔ 原檔無損保留並封裝為 `-Media.zip` (`Media-YYYY-MM-DD/`)
     - **原始壓縮檔** ➔ 自動歸檔至各自來源目錄下的 `OriginalFiles-YYYY-MM-DD/`
     - **損毀壓縮檔** ➔ 自動隔離至 `FileErr-YYYY-MM-DD/` 並產出 `corrupted_search.html` 一鍵搜尋救援清單
+- **📦 雙卡對稱「Pack & Unpack Studio（封裝與解壓工作站）」**：
+  - **即時目錄偵測列 (Live Directory Inspector)**：選擇目標資料夾後，即時掃描並顯示可打包的子資料夾數量與可解壓的壓縮檔數量。
+  - **Quick Folder Packer（子資料夾 ➔ 壓縮檔）**：將目標目錄下的第一層子資料夾批次封裝為零壓縮 `.zip` 或 `.cbz`（`ZIP_STORED / zip -0`），支援自然頁碼排序與原資料夾自動歸檔至 `OriginalFiles-YYYY-MM-DD/`。
+  - **Quick Archive Unpacker（壓縮檔 ➔ `Unzipped-YYYY-MM-DD/`）**：批次解壓 `.zip`、`.cbz`、`.rar`、`.cbr`、`.7z` 至 `Unzipped-YYYY-MM-DD/<檔名>/`，內建 **Smart Flatten（智慧單層化，自動消除 `Book/Book/001.jpg` 雙重巢狀資料夾並清除 `__MACOSX`、`.DS_Store` 垃圾檔）**。
+  - **一鍵往返工作流 (`🎯 Switch to Unzipped`)**：解壓完成並整理圖片後，點擊工具列上的 `🎯 Switch to Unzipped` 即可一鍵切換目標路徑至最新的 `Unzipped-YYYY-MM-DD`，立即透過左卡重新打包回 `.cbz` / `.zip`。
 - **📊 全時期歷史統計資料庫與參數自動記憶**：
   - 內建 SQLite 資料庫 (`history.db`) 永久記錄每次轉檔的頁數、原始大小、最佳化後大小、節省空間比例與耗時，支援關鍵字篩選、雙擊在 Finder 開啟與匯出 CSV 報表。
   - 所有介面設定（來源清單、輸出路徑、解析度預設、JPEG 品質、RAM Disk 容量、I/O 限制）皆自動儲存於 `config.json`。

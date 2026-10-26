@@ -208,6 +208,7 @@ SYSTEM_DIR_PREFIXES = (
     "Processed-",
     "FileErr-",
     "Error-",
+    "Unzipped-",
 )
 
 ARCHIVE_MAIN_EXT = '.cbz'
@@ -1153,6 +1154,107 @@ def pack_folder_worker(
     status_dict[worker_id] = {"tier": "-", "stage": "Idle", "name": "-", "progress": 0.0, "detail": ""}
     return folder_path_str, "SUCCESS"
 
+def unpack_archive_worker(
+    archive_path_str: str, unzipped_root_str: str, worker_id: int,
+    status_dict, recent_logs, move_to_orig_dir_str: str = None,
+    file_err_dir_str: str = None, smart_flatten: bool = True, abort_flag=None
+):
+    if abort_flag is not None and abort_flag.value:
+        status_dict[worker_id] = {"tier": "-", "stage": "Idle", "name": "-", "progress": 0.0, "detail": ""}
+        return archive_path_str, "ABORTED"
+
+    archive_path = Path(archive_path_str)
+    unzipped_root = Path(unzipped_root_str)
+    unzipped_root.mkdir(parents=True, exist_ok=True)
+    temp_extract_dir = unzipped_root / f".unpacking_{archive_path.stem}_{worker_id}.tmp"
+    if temp_extract_dir.exists():
+        shutil.rmtree(temp_extract_dir, ignore_errors=True)
+    temp_extract_dir.mkdir(parents=True, exist_ok=True)
+
+    start_time = time.time()
+    clean_name = sanitize_log_text(archive_path.name)
+
+    def update_unpack_progress(ratio: float, elapsed: float):
+        status_dict[worker_id] = {
+            "tier": "DISK", "stage": "Extracting", "name": clean_name,
+            "progress": ratio * 0.92, "detail": f"{elapsed:.1f}s ({int(ratio * 100)}%)"
+        }
+
+    try:
+        success, reason = extract_archive_stream(
+            archive_path, temp_extract_dir, progress_callback=update_unpack_progress, abort_flag=abort_flag
+        )
+    except BaseException:
+        shutil.rmtree(temp_extract_dir, ignore_errors=True)
+        status_dict[worker_id] = {"tier": "-", "stage": "Idle", "name": "-", "progress": 0.0, "detail": ""}
+        return archive_path_str, "ABORTED"
+
+    if not success or (abort_flag is not None and abort_flag.value):
+        shutil.rmtree(temp_extract_dir, ignore_errors=True)
+        status_dict[worker_id] = {"tier": "-", "stage": "Idle", "name": "-", "progress": 0.0, "detail": ""}
+        if reason == "ABORTED" or (abort_flag is not None and abort_flag.value):
+            return archive_path_str, "ABORTED"
+        if reason == "CORRUPTED" and file_err_dir_str:
+            safe_move_file(archive_path, Path(file_err_dir_str))
+            recent_logs.append(("FILE_ERR", clean_name, "Corrupted Archive"))
+            return archive_path_str, "FILE_ERR"
+        recent_logs.append(("SYS_ERR", clean_name, f"Extract Failed ({reason})"))
+        return archive_path_str, "ERROR"
+
+    # 清除 macOS 垃圾目錄與隱藏檔 (__MACOSX, .DS_Store, ._*)
+    file_count = 0
+    for root, dirs, files in os.walk(temp_extract_dir, topdown=False):
+        root_p = Path(root)
+        for f in files:
+            fp = root_p / f
+            if f == ".DS_Store" or f.startswith("._"):
+                try:
+                    fp.unlink(missing_ok=True)
+                except Exception:
+                    pass
+            else:
+                file_count += 1
+        for d in dirs:
+            dp = root_p / d
+            if d == "__MACOSX":
+                shutil.rmtree(dp, ignore_errors=True)
+
+    if file_count == 0:
+        shutil.rmtree(temp_extract_dir, ignore_errors=True)
+        recent_logs.append(("SKIP", clean_name, "Empty Archive"))
+        status_dict[worker_id] = {"tier": "-", "stage": "Idle", "name": "-", "progress": 0.0, "detail": ""}
+        return archive_path_str, "SKIP"
+
+    # 智慧單層目錄標準化 (Smart Flatten)：若解壓後內層只有唯一一個資料夾且無散落檔案，自動消除多餘的套娃層級
+    source_to_move = temp_extract_dir
+    if smart_flatten:
+        while True:
+            entries = [e for e in source_to_move.iterdir() if not e.name.startswith(".")]
+            if len(entries) == 1 and entries[0].is_dir():
+                source_to_move = entries[0]
+            else:
+                break
+
+    final_dir = unzipped_root / archive_path.stem
+    counter = 1
+    while final_dir.exists():
+        final_dir = unzipped_root / f"{archive_path.stem}_{counter}"
+        counter += 1
+
+    try:
+        shutil.move(str(source_to_move), str(final_dir))
+    finally:
+        if temp_extract_dir.exists():
+            shutil.rmtree(temp_extract_dir, ignore_errors=True)
+
+    if move_to_orig_dir_str:
+        safe_move_file(archive_path, Path(move_to_orig_dir_str))
+
+    cost = time.time() - start_time
+    recent_logs.append(("OK", clean_name, f"Unpacked ({cost:.1f}s, {file_count}F)"))
+    status_dict[worker_id] = {"tier": "-", "stage": "Idle", "name": "-", "progress": 0.0, "detail": ""}
+    return archive_path_str, "SUCCESS"
+
 def terminate_executor_immediately(executor: ProcessPoolExecutor, futures_iterable=()):
     """立即取消未執行任務並強制終止所有 Worker 行程及其衍生子行程 (如 7zz)，不阻塞等待"""
     for f in list(futures_iterable):
@@ -1594,10 +1696,12 @@ class FolderPackerThread(QThread):
     finished_signal = pyqtSignal(dict)
     error_signal = pyqtSignal(str)
 
-    def __init__(self, source_dir_str: str, out_ext: str):
+    def __init__(self, source_dir_str: str, out_ext: str, move_orig: bool = False, io_limit: int = 3):
         super().__init__()
         self.source_dir = Path(source_dir_str)
         self.out_ext = out_ext
+        self.move_orig = move_orig
+        self.io_limit = max(1, io_limit)
         self.is_aborted = False
         self.abort_flag = None
 
@@ -1617,6 +1721,7 @@ class FolderPackerThread(QThread):
             pass
 
     def run(self):
+        today_str = datetime.now().strftime("%Y-%m-%d")
         sub_dirs = []
         try:
             for item in self.source_dir.iterdir():
@@ -1628,11 +1733,12 @@ class FolderPackerThread(QThread):
             return
 
         if not sub_dirs:
-            self.error_signal.emit("No valid first-level directories found to compress.")
+            self.error_signal.emit("No valid first-level subfolders found to pack.")
             return
 
         sub_dirs.sort(key=lambda x: natural_sort_key(x.name))
         num_workers = max(1, os.cpu_count() - 1)
+        effective_workers = min(num_workers, self.io_limit)
 
         manager = multiprocessing.Manager()
         self.abort_flag = manager.Value('b', self.is_aborted)
@@ -1646,10 +1752,11 @@ class FolderPackerThread(QThread):
         skip_count = 0
         done_total = 0
 
+        orig_dest_str = str(self.source_dir / f"OriginalFiles-{today_str}") if self.move_orig else None
         pending_queue = list(sub_dirs)
-        available_workers = set(range(num_workers))
+        available_workers = set(range(effective_workers))
         active_futures = {}
-        executor = ProcessPoolExecutor(max_workers=num_workers)
+        executor = ProcessPoolExecutor(max_workers=effective_workers)
 
         try:
             while (pending_queue or active_futures) and not self.is_aborted:
@@ -1675,7 +1782,7 @@ class FolderPackerThread(QThread):
                     worker_id = available_workers.pop()
                     f = executor.submit(
                         pack_folder_worker, str(chosen_folder), self.out_ext,
-                        worker_id, worker_statuses, recent_logs, None, self.abort_flag
+                        worker_id, worker_statuses, recent_logs, orig_dest_str, self.abort_flag
                     )
                     active_futures[f] = worker_id
 
@@ -1702,6 +1809,144 @@ class FolderPackerThread(QThread):
             "skipped": skip_count,
             "aborted": self.is_aborted,
             "target_dir": str(self.source_dir)
+        }
+        self.finished_signal.emit(summary_payload)
+
+class ArchiveUnpackerThread(QThread):
+    progress_signal = pyqtSignal(int, int)
+    worker_signal = pyqtSignal(dict)
+    log_signal = pyqtSignal(list)
+    finished_signal = pyqtSignal(dict)
+    error_signal = pyqtSignal(str)
+
+    def __init__(
+        self, source_dir_str: str, smart_flatten: bool = True,
+        move_orig: bool = True, io_limit: int = 3
+    ):
+        super().__init__()
+        self.source_dir = Path(source_dir_str)
+        self.smart_flatten = smart_flatten
+        self.move_orig = move_orig
+        self.io_limit = max(1, io_limit)
+        self.is_aborted = False
+        self.abort_flag = None
+
+    def abort(self):
+        self.is_aborted = True
+        if self.abort_flag is not None:
+            try:
+                self.abort_flag.value = True
+            except Exception:
+                pass
+
+    def _cleanup_leftover_tmp_unpacks(self, unzipped_root: Path):
+        if not unzipped_root.exists():
+            return
+        try:
+            for p in unzipped_root.glob(".unpacking_*.tmp"):
+                shutil.rmtree(p, ignore_errors=True)
+        except Exception:
+            pass
+
+    def run(self):
+        today_str = datetime.now().strftime("%Y-%m-%d")
+        unzipped_root = self.source_dir / f"Unzipped-{today_str}"
+        orig_dest_str = str(self.source_dir / f"OriginalFiles-{today_str}") if self.move_orig else None
+        file_err_str = str(self.source_dir / f"FileErr-{today_str}")
+
+        archives = []
+        try:
+            for item in self.source_dir.iterdir():
+                if item.is_file() and not item.name.startswith("."):
+                    if item.suffix.lower() in ARCHIVE_EXTENSIONS:
+                        archives.append(item)
+        except Exception as e:
+            self.error_signal.emit(f"Failed to access directory: {e}")
+            return
+
+        if not archives:
+            self.error_signal.emit("No supported archives (.zip, .cbz, .rar, .cbr, .7z) found in the target directory.")
+            return
+
+        archives.sort(key=lambda x: natural_sort_key(x.name))
+        num_workers = max(1, os.cpu_count() - 1)
+        effective_workers = min(num_workers, self.io_limit)
+
+        manager = multiprocessing.Manager()
+        self.abort_flag = manager.Value('b', self.is_aborted)
+        worker_statuses = manager.dict()
+        recent_logs = manager.list()
+        for i in range(num_workers):
+            worker_statuses[i] = {"tier": "-", "stage": "Idle", "name": "-", "progress": 0.0, "detail": ""}
+
+        global_start_time = time.time()
+        success_count = 0
+        corrupted_count = 0
+        skip_count = 0
+        done_total = 0
+
+        pending_queue = list(archives)
+        available_workers = set(range(effective_workers))
+        active_futures = {}
+        executor = ProcessPoolExecutor(max_workers=effective_workers)
+
+        try:
+            while (pending_queue or active_futures) and not self.is_aborted:
+                done_futures = [f for f in active_futures if f.done()]
+                for f in done_futures:
+                    worker_id = active_futures.pop(f)
+                    available_workers.add(worker_id)
+                    try:
+                        _, code = f.result()
+                        if code == "ABORTED":
+                            continue
+                        done_total += 1
+                        if code == "SUCCESS":
+                            success_count += 1
+                        elif code == "FILE_ERR":
+                            corrupted_count += 1
+                        else:
+                            skip_count += 1
+                    except Exception:
+                        if not self.is_aborted:
+                            done_total += 1
+                            skip_count += 1
+                    self.progress_signal.emit(done_total, len(archives))
+
+                while available_workers and pending_queue and not self.is_aborted:
+                    chosen_arch = pending_queue.pop(0)
+                    worker_id = available_workers.pop()
+                    f = executor.submit(
+                        unpack_archive_worker, str(chosen_arch), str(unzipped_root),
+                        worker_id, worker_statuses, recent_logs,
+                        orig_dest_str, file_err_str, self.smart_flatten, self.abort_flag
+                    )
+                    active_futures[f] = worker_id
+
+                self.worker_signal.emit(dict(worker_statuses))
+                self.log_signal.emit(list(recent_logs))
+                time.sleep(0.1)
+        finally:
+            if self.is_aborted:
+                terminate_executor_immediately(executor, active_futures.keys())
+                self._cleanup_leftover_tmp_unpacks(unzipped_root)
+            else:
+                executor.shutdown(wait=True)
+            for i in range(num_workers):
+                worker_statuses[i] = {"tier": "-", "stage": "Idle", "name": "-", "progress": 0.0, "detail": ""}
+            self.worker_signal.emit(dict(worker_statuses))
+            self.log_signal.emit(list(recent_logs))
+
+        total_cost = time.time() - global_start_time
+        summary_payload = {
+            "mode": "unpacker",
+            "total_time": total_cost,
+            "total_files": len(archives),
+            "success": success_count,
+            "corrupted": corrupted_count,
+            "skipped": skip_count,
+            "aborted": self.is_aborted,
+            "target_dir": str(unzipped_root)
         }
         self.finished_signal.emit(summary_payload)
 
@@ -1996,53 +2241,190 @@ class MainWindow(QMainWindow):
 
         self.tabs.addTab(tab_opt, "⚡ Comic Optimizer (Multi-Source & Resize)")
 
-        # ---- Tab 2: First-level Folder Store Packer ----
+        # ---- Tab 2: Pack & Unpack Studio (Dual-Card Symmetrical Workspace) ----
         tab_pack = QWidget()
         layout_pack = QVBoxLayout(tab_pack)
-        layout_pack.setContentsMargins(12, 16, 12, 16)
-        layout_pack.setSpacing(12)
+        layout_pack.setContentsMargins(12, 10, 12, 10)
+        layout_pack.setSpacing(8)
 
-        pack_desc = QLabel(
-            "Batch-pack all first-level subfolders inside the target directory into zero-compression archives (ZIP_STORED / zip -0)."
-        )
-        pack_desc.setStyleSheet("color: #94a3b8; font-size: 12px;")
-        layout_pack.addWidget(pack_desc)
-
+        # Shared Target Directory Bar + Live Inspector Badge
         row_pack = QHBoxLayout()
+        row_pack.setSpacing(8)
         self.path_input_pack = DropLineEdit()
         self.path_input_pack.setPlaceholderText("Drag & drop target folder here, or click Browse...")
-        self.path_input_pack.textChanged.connect(lambda _: self.save_user_settings())
+        self.path_input_pack.textChanged.connect(self.on_pack_target_changed)
+
         browse_btn_pack = QPushButton("Browse...")
         browse_btn_pack.clicked.connect(lambda: self.browse_folder(self.path_input_pack))
-        open_pack_btn = QPushButton("Open in Finder")
-        open_pack_btn.clicked.connect(lambda: reveal_in_finder(Path(self.path_input_pack.text().strip())) if self.path_input_pack.text().strip() else None)
 
+        open_pack_btn = QPushButton("Open in Finder")
+        open_pack_btn.clicked.connect(
+            lambda: reveal_in_finder(Path(self.path_input_pack.text().strip()))
+            if self.path_input_pack.text().strip() else None
+        )
+
+        self.use_unzipped_btn = QPushButton("🎯 Switch to Unzipped")
+        self.use_unzipped_btn.setToolTip(
+            "One-click round-trip workflow: Jump into the latest Unzipped-YYYY-MM-DD folder to re-pack edited subfolders, or jump back to parent."
+        )
+        self.use_unzipped_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #1e293b; color: #38bdf8; font-weight: 600;
+                border: 1px solid #0284c7; padding: 5px 11px;
+            }
+            QPushButton:hover { background-color: #0f172a; border-color: #38bdf8; }
+            QPushButton:disabled { color: #475569; border-color: #1e293b; }
+        """)
+        self.use_unzipped_btn.setEnabled(False)
+        self.use_unzipped_btn.clicked.connect(self.switch_pack_target_to_unzipped)
+
+        target_lbl = QLabel("Target Folder:")
+        target_lbl.setStyleSheet("font-weight: 700; color: #cbd5e1;")
+        row_pack.addWidget(target_lbl)
+        row_pack.addWidget(self.path_input_pack, stretch=2)
+        row_pack.addWidget(browse_btn_pack)
+        row_pack.addWidget(open_pack_btn)
+        row_pack.addWidget(self.use_unzipped_btn)
+        layout_pack.addLayout(row_pack)
+
+        # Live Directory Inspector Bar
+        inspect_bar = QHBoxLayout()
+        inspect_bar.setContentsMargins(2, 0, 2, 0)
+        self.pack_inspect_label = QLabel("💡 Select or drop a target directory above to inspect subfolders & archives.")
+        self.pack_inspect_label.setStyleSheet(
+            "color: #94a3b8; font-size: 12px; font-weight: 600; background-color: #0b1120; "
+            "border: 1px solid #1e293b; border-radius: 5px; padding: 4px 10px;"
+        )
+        inspect_bar.addWidget(self.pack_inspect_label, stretch=1)
+        layout_pack.addLayout(inspect_bar)
+
+        # Dual Action Cards (Left: Quick Folder Packer | Right: Quick Archive Unpacker)
+        cards_row = QHBoxLayout()
+        cards_row.setSpacing(12)
+
+        # --- Left Card: Quick Folder Packer ---
+        pack_card = QFrame()
+        pack_card.setStyleSheet("""
+            QFrame {
+                background-color: #0b1120;
+                border: 1px solid #1e293b;
+                border-radius: 8px;
+            }
+            QLabel { border: none; background: transparent; }
+            QCheckBox { border: none; background: transparent; }
+        """)
+        pack_card_layout = QVBoxLayout(pack_card)
+        pack_card_layout.setContentsMargins(14, 10, 14, 10)
+        pack_card_layout.setSpacing(6)
+
+        pack_title = QLabel("📦 Quick Folder Packer  (Subfolders ➔ Archive)")
+        pack_title.setStyleSheet("font-size: 13px; font-weight: 800; color: #60a5fa;")
+        pack_sub = QLabel(
+            "Packs each first-level subfolder into a zero-compression archive (ZIP_STORED / zip -0) with natural page sorting."
+        )
+        pack_sub.setWordWrap(True)
+        pack_sub.setStyleSheet("font-size: 11px; color: #94a3b8;")
+
+        pack_opts_row = QHBoxLayout()
         self.cbz_format_check = QCheckBox("Output .cbz instead of .zip")
         self.cbz_format_check.setChecked(False)
+        self.cbz_format_check.setToolTip("Save packed archives with .cbz comic book extension instead of .zip")
         self.cbz_format_check.toggled.connect(lambda _: self.save_user_settings())
 
-        self.start_btn_pack = QPushButton("▶  Pack Subfolders")
+        self.pack_move_orig_check = QCheckBox("Move subfolders to OriginalFiles-YYYY-MM-DD")
+        self.pack_move_orig_check.setChecked(True)
+        self.pack_move_orig_check.setToolTip(
+            "After a subfolder is safely packed, move the original subfolder into OriginalFiles-YYYY-MM-DD"
+        )
+        self.pack_move_orig_check.toggled.connect(lambda _: self.save_user_settings())
+
+        pack_opts_row.addWidget(self.cbz_format_check)
+        pack_opts_row.addSpacing(10)
+        pack_opts_row.addWidget(self.pack_move_orig_check)
+        pack_opts_row.addStretch()
+
+        self.start_btn_pack = QPushButton("📦  Pack All Subfolders")
         self.start_btn_pack.setStyleSheet("""
             QPushButton {
                 background-color: #2563eb; color: white; font-weight: bold;
-                padding: 7px 18px; border: 1px solid #3b82f6; font-size: 13px;
+                padding: 7px 18px; border: 1px solid #3b82f6; font-size: 13px; border-radius: 5px;
             }
             QPushButton:hover { background-color: #3b82f6; }
             QPushButton:disabled { background-color: #1e293b; color: #475569; border-color: #334155; }
         """)
         self.start_btn_pack.clicked.connect(self.start_folder_packer)
 
-        row_pack.addWidget(QLabel("Target:"))
-        row_pack.addWidget(self.path_input_pack, stretch=2)
-        row_pack.addWidget(browse_btn_pack)
-        row_pack.addWidget(open_pack_btn)
-        row_pack.addSpacing(8)
-        row_pack.addWidget(self.cbz_format_check)
-        row_pack.addSpacing(8)
-        row_pack.addWidget(self.start_btn_pack)
-        layout_pack.addLayout(row_pack)
-        layout_pack.addStretch()
-        self.tabs.addTab(tab_pack, "📦 Quick Folder Packer (Store zip -0)")
+        pack_card_layout.addWidget(pack_title)
+        pack_card_layout.addWidget(pack_sub)
+        pack_card_layout.addLayout(pack_opts_row)
+        pack_card_layout.addStretch()
+        pack_card_layout.addWidget(self.start_btn_pack)
+
+        # --- Right Card: Quick Archive Unpacker ---
+        unpack_card = QFrame()
+        unpack_card.setStyleSheet("""
+            QFrame {
+                background-color: #0b1120;
+                border: 1px solid #1e293b;
+                border-radius: 8px;
+            }
+            QLabel { border: none; background: transparent; }
+            QCheckBox { border: none; background: transparent; }
+        """)
+        unpack_card_layout = QVBoxLayout(unpack_card)
+        unpack_card_layout.setContentsMargins(14, 10, 14, 10)
+        unpack_card_layout.setSpacing(6)
+
+        unpack_title = QLabel("📂 Quick Archive Unpacker  (Archives ➔ Unzipped-YYYY-MM-DD)")
+        unpack_title.setStyleSheet("font-size: 13px; font-weight: 800; color: #c084fc;")
+        unpack_sub = QLabel(
+            "Batch-extracts .zip, .cbz, .rar, .cbr, .7z into Unzipped-YYYY-MM-DD/<ArchiveName>/ and isolates bad files to FileErr."
+        )
+        unpack_sub.setWordWrap(True)
+        unpack_sub.setStyleSheet("font-size: 11px; color: #94a3b8;")
+
+        unpack_opts_row = QHBoxLayout()
+        self.unpack_flatten_check = QCheckBox("Smart Flatten (Unwrap nested folder & clean junk)")
+        self.unpack_flatten_check.setChecked(True)
+        self.unpack_flatten_check.setToolTip(
+            "Prevent double-nesting (Unzipped/Book/Book/001.jpg ➔ Unzipped/Book/001.jpg) and remove __MACOSX & .DS_Store"
+        )
+        self.unpack_flatten_check.toggled.connect(lambda _: self.save_user_settings())
+
+        self.unpack_move_orig_check = QCheckBox("Move archives to OriginalFiles-YYYY-MM-DD")
+        self.unpack_move_orig_check.setChecked(True)
+        self.unpack_move_orig_check.setToolTip(
+            "After an archive is safely extracted, move the original archive into OriginalFiles-YYYY-MM-DD"
+        )
+        self.unpack_move_orig_check.toggled.connect(lambda _: self.save_user_settings())
+
+        unpack_opts_row.addWidget(self.unpack_flatten_check)
+        unpack_opts_row.addSpacing(10)
+        unpack_opts_row.addWidget(self.unpack_move_orig_check)
+        unpack_opts_row.addStretch()
+
+        self.start_btn_unpack = QPushButton("📂  Unpack All Archives")
+        self.start_btn_unpack.setStyleSheet("""
+            QPushButton {
+                background-color: #7c3aed; color: white; font-weight: bold;
+                padding: 7px 18px; border: 1px solid #8b5cf6; font-size: 13px; border-radius: 5px;
+            }
+            QPushButton:hover { background-color: #8b5cf6; }
+            QPushButton:disabled { background-color: #1e293b; color: #475569; border-color: #334155; }
+        """)
+        self.start_btn_unpack.clicked.connect(self.start_archive_unpacker)
+
+        unpack_card_layout.addWidget(unpack_title)
+        unpack_card_layout.addWidget(unpack_sub)
+        unpack_card_layout.addLayout(unpack_opts_row)
+        unpack_card_layout.addStretch()
+        unpack_card_layout.addWidget(self.start_btn_unpack)
+
+        cards_row.addWidget(pack_card, stretch=1)
+        cards_row.addWidget(unpack_card, stretch=1)
+        layout_pack.addLayout(cards_row)
+
+        self.tabs.addTab(tab_pack, "📦 Pack & Unpack Studio")
 
         # ---- Tab 3: History & Statistics (Full-Height Workspace) ----
         tab_hist = QWidget()
@@ -2278,8 +2660,85 @@ class MainWindow(QMainWindow):
             target_line_edit.setText(folder)
             self.save_user_settings()
 
+    def on_pack_target_changed(self, _text: str = ""):
+        self.refresh_pack_target_stats()
+        self.save_user_settings()
+
+    def refresh_pack_target_stats(self):
+        if not hasattr(self, "pack_inspect_label"):
+            return
+        folder_str = self.path_input_pack.text().strip()
+        if not folder_str:
+            self.pack_inspect_label.setText(
+                "💡 Select or drop a target directory above to inspect subfolders & archives."
+            )
+            self.start_btn_pack.setText("📦  Pack All Subfolders")
+            self.start_btn_unpack.setText("📂  Unpack All Archives")
+            self.use_unzipped_btn.setEnabled(False)
+            self.use_unzipped_btn.setText("🎯 Switch to Unzipped")
+            return
+
+        p = Path(folder_str)
+        if not p.is_dir():
+            self.pack_inspect_label.setText("⚠️ Target directory does not exist.")
+            self.start_btn_pack.setText("📦  Pack All Subfolders")
+            self.start_btn_unpack.setText("📂  Unpack All Archives")
+            self.use_unzipped_btn.setEnabled(False)
+            return
+
+        subfolders_cnt = 0
+        archives_cnt = 0
+        unzipped_dirs = []
+        try:
+            for item in p.iterdir():
+                if item.name.startswith("."):
+                    continue
+                if item.is_dir():
+                    if item.name.startswith("Unzipped-"):
+                        unzipped_dirs.append(item)
+                    if not item.name.startswith(SYSTEM_DIR_PREFIXES):
+                        subfolders_cnt += 1
+                elif item.is_file() and item.suffix.lower() in ARCHIVE_EXTENSIONS:
+                    archives_cnt += 1
+        except Exception:
+            pass
+
+        self.start_btn_pack.setText(f"📦  Pack Subfolders ({subfolders_cnt})")
+        self.start_btn_unpack.setText(f"📂  Unpack Archives ({archives_cnt})")
+
+        # Configure the round-trip quick-switch button
+        if p.name.startswith("Unzipped-") and p.parent.is_dir():
+            self.use_unzipped_btn.setEnabled(True)
+            self.use_unzipped_btn.setText("⬆️ Back to Parent Folder")
+            self.use_unzipped_btn.setProperty("target_jump", str(p.parent))
+        elif unzipped_dirs:
+            latest_unz = sorted(unzipped_dirs, key=lambda x: x.name)[-1]
+            self.use_unzipped_btn.setEnabled(True)
+            self.use_unzipped_btn.setText(f"🎯 Switch to {latest_unz.name}")
+            self.use_unzipped_btn.setProperty("target_jump", str(latest_unz))
+        else:
+            self.use_unzipped_btn.setEnabled(False)
+            self.use_unzipped_btn.setText("🎯 Switch to Unzipped")
+            self.use_unzipped_btn.setProperty("target_jump", "")
+
+        unz_hint = (
+            f"   |   ✨ Found {len(unzipped_dirs)} Unzipped folder(s) — click '{self.use_unzipped_btn.text()}' to re-pack!"
+            if unzipped_dirs else ""
+        )
+        self.pack_inspect_label.setText(
+            f"📊 Live Target Scan:   📦 {subfolders_cnt} Subfolder(s) ready to Pack   |   "
+            f"📂 {archives_cnt} Archive(s) (.zip/.cbz/.rar/.cbr/.7z) ready to Unpack{unz_hint}"
+        )
+
+    def switch_pack_target_to_unzipped(self):
+        jump_to = self.use_unzipped_btn.property("target_jump")
+        if jump_to and os.path.isdir(jump_to):
+            self.path_input_pack.setText(jump_to)
+
     def on_tab_changed(self, idx: int):
-        if idx == 2:
+        if idx == 1:
+            self.refresh_pack_target_stats()
+        elif idx == 2:
             self.refresh_history_view()
         self.update_monitor_visibility()
         self.save_user_settings()
@@ -2315,12 +2774,19 @@ class MainWindow(QMainWindow):
                 self.path_input_pack.setText(str(cfg["pack_target_dir"]))
             if "pack_cbz_format" in cfg:
                 self.cbz_format_check.setChecked(bool(cfg["pack_cbz_format"]))
+            if "pack_move_orig" in cfg:
+                self.pack_move_orig_check.setChecked(bool(cfg["pack_move_orig"]))
+            if "unpack_smart_flatten" in cfg:
+                self.unpack_flatten_check.setChecked(bool(cfg["unpack_smart_flatten"]))
+            if "unpack_move_orig" in cfg:
+                self.unpack_move_orig_check.setChecked(bool(cfg["unpack_move_orig"]))
             if "current_tab_index" in cfg and isinstance(cfg["current_tab_index"], int):
                 tab_idx = cfg["current_tab_index"]
                 if 0 <= tab_idx < self.tabs.count():
                     self.tabs.setCurrentIndex(tab_idx)
         finally:
             self._loading_settings = False
+            self.refresh_pack_target_stats()
 
     def save_user_settings(self):
         if getattr(self, "_loading_settings", False):
@@ -2335,6 +2801,9 @@ class MainWindow(QMainWindow):
             "io_limit": self.io_limit_spin.value(),
             "pack_target_dir": self.path_input_pack.text().strip(),
             "pack_cbz_format": self.cbz_format_check.isChecked(),
+            "pack_move_orig": self.pack_move_orig_check.isChecked(),
+            "unpack_smart_flatten": self.unpack_flatten_check.isChecked(),
+            "unpack_move_orig": self.unpack_move_orig_check.isChecked(),
             "current_tab_index": self.tabs.currentIndex(),
         }
         save_app_config(cfg)
@@ -2501,10 +2970,31 @@ class MainWindow(QMainWindow):
 
         self.save_user_settings()
         out_ext = ".cbz" if self.cbz_format_check.isChecked() else ".zip"
+        move_orig = self.pack_move_orig_check.isChecked()
         self.prepare_ui_for_start()
         self.worker_thread = FolderPackerThread(
             source_dir_str=folder_path,
-            out_ext=out_ext
+            out_ext=out_ext,
+            move_orig=move_orig,
+            io_limit=self.io_limit_spin.value()
+        )
+        self.bind_and_start_thread()
+
+    def start_archive_unpacker(self):
+        folder_path = self.path_input_pack.text().strip()
+        if not folder_path or not os.path.isdir(folder_path):
+            QMessageBox.warning(self, "Input Error", "Please provide a valid directory containing archives.")
+            return
+
+        self.save_user_settings()
+        smart_flatten = self.unpack_flatten_check.isChecked()
+        move_orig = self.unpack_move_orig_check.isChecked()
+        self.prepare_ui_for_start()
+        self.worker_thread = ArchiveUnpackerThread(
+            source_dir_str=folder_path,
+            smart_flatten=smart_flatten,
+            move_orig=move_orig,
+            io_limit=self.io_limit_spin.value()
         )
         self.bind_and_start_thread()
 
@@ -2513,6 +3003,8 @@ class MainWindow(QMainWindow):
         self._rendered_log_count = 0
         self.start_btn_opt.setEnabled(False)
         self.start_btn_pack.setEnabled(False)
+        self.start_btn_unpack.setEnabled(False)
+        self.use_unzipped_btn.setEnabled(False)
         self.tabs.setEnabled(False)
         self.abort_btn.setEnabled(True)
         self.log_table.setRowCount(0)
@@ -2643,6 +3135,7 @@ class MainWindow(QMainWindow):
     def on_finished(self, summary: dict):
         self.reset_ui()
         self.refresh_history_view()
+        self.refresh_pack_target_stats()
         mode = summary.get("mode")
         hrs, rem = divmod(int(summary["total_time"]), 3600)
         mins, secs = divmod(rem, 60)
@@ -2660,6 +3153,14 @@ class MainWindow(QMainWindow):
                 f"Space Saved: {format_bytes(max(0, saved_bytes))} (▼ {saved_pct:.1f}%)\n\n"
                 f"Output Location:\n- {summary['out_loc']}"
             )
+        elif mode == "unpacker":
+            msg = (
+                f"Execution Time: {time_str}\n"
+                f"Archives Unpacked: {summary['success']} OK / {summary['corrupted']} Corrupted / "
+                f"{summary['skipped']} Skipped / {summary['error']} Failed\n\n"
+                f"Unzipped Destination:\n- {summary['unzipped_dir']}\n\n"
+                f"💡 Tip: Click '🎯 Switch to Unzipped' in the Studio toolbar to inspect or re-pack!"
+            )
         else:
             msg = (
                 f"Execution Time: {time_str}\n"
@@ -2673,10 +3174,12 @@ class MainWindow(QMainWindow):
     def reset_ui(self):
         self.start_btn_opt.setEnabled(True)
         self.start_btn_pack.setEnabled(True)
+        self.start_btn_unpack.setEnabled(True)
         self.tabs.setEnabled(True)
         self.abort_btn.setEnabled(False)
         self.status_label.setText("Idle")
         self.eta_label.setText("Elapsed: 00:00 | ETA: --:--")
+        self.refresh_pack_target_stats()
 
 if __name__ == "__main__":
     multiprocessing.freeze_support()
