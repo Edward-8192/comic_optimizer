@@ -1883,6 +1883,7 @@ class ArchiveUnpackerThread(QThread):
         success_count = 0
         corrupted_count = 0
         skip_count = 0
+        error_count = 0
         done_total = 0
 
         pending_queue = list(archives)
@@ -1905,12 +1906,14 @@ class ArchiveUnpackerThread(QThread):
                             success_count += 1
                         elif code == "FILE_ERR":
                             corrupted_count += 1
+                        elif code == "SYS_ERR":
+                            error_count += 1
                         else:
                             skip_count += 1
                     except Exception:
                         if not self.is_aborted:
                             done_total += 1
-                            skip_count += 1
+                            error_count += 1
                     self.progress_signal.emit(done_total, len(archives))
 
                 while available_workers and pending_queue and not self.is_aborted:
@@ -1945,8 +1948,10 @@ class ArchiveUnpackerThread(QThread):
             "success": success_count,
             "corrupted": corrupted_count,
             "skipped": skip_count,
+            "error": error_count,
             "aborted": self.is_aborted,
-            "target_dir": str(unzipped_root)
+            "unzipped_dir": str(unzipped_root),
+            "target_dir": str(unzipped_root),
         }
         self.finished_signal.emit(summary_payload)
 
@@ -3142,30 +3147,33 @@ class MainWindow(QMainWindow):
         time_str = f"{hrs:02d}:{mins:02d}:{secs:02d}" if hrs > 0 else f"{mins:02d}:{secs:02d}"
 
         if mode == "optimizer":
-            saved_bytes = summary["orig_bytes"] - summary["out_bytes"]
-            saved_pct = (saved_bytes / summary["orig_bytes"] * 100) if summary["orig_bytes"] > 0 else 0.0
+            orig_b = summary.get("orig_bytes", 0)
+            out_b = summary.get("out_bytes", 0)
+            saved_bytes = orig_b - out_b
+            saved_pct = (saved_bytes / orig_b * 100) if orig_b > 0 else 0.0
             msg = (
                 f"Execution Time: {time_str}\n"
-                f"Sources Processed: {summary['source_count']} directories\n"
-                f"Files Completed: {summary['success']} OK / {summary['corrupted']} Corrupted / {summary['error']} Failed\n\n"
-                f"Original Size: {format_bytes(summary['orig_bytes'])}\n"
-                f"Optimized Size: {format_bytes(summary['out_bytes'])}\n"
+                f"Sources Processed: {summary.get('source_count', 0)} directories\n"
+                f"Files Completed: {summary.get('success', 0)} OK / {summary.get('corrupted', 0)} Corrupted / {summary.get('error', 0)} Failed\n\n"
+                f"Original Size: {format_bytes(orig_b)}\n"
+                f"Optimized Size: {format_bytes(out_b)}\n"
                 f"Space Saved: {format_bytes(max(0, saved_bytes))} (▼ {saved_pct:.1f}%)\n\n"
-                f"Output Location:\n- {summary['out_loc']}"
+                f"Output Location:\n- {summary.get('out_loc', '')}"
             )
         elif mode == "unpacker":
+            unz_dest = summary.get("unzipped_dir") or summary.get("target_dir", "")
             msg = (
                 f"Execution Time: {time_str}\n"
-                f"Archives Unpacked: {summary['success']} OK / {summary['corrupted']} Corrupted / "
-                f"{summary['skipped']} Skipped / {summary['error']} Failed\n\n"
-                f"Unzipped Destination:\n- {summary['unzipped_dir']}\n\n"
+                f"Archives Unpacked: {summary.get('success', 0)} OK / {summary.get('corrupted', 0)} Corrupted / "
+                f"{summary.get('skipped', 0)} Skipped / {summary.get('error', 0)} Failed\n\n"
+                f"Unzipped Destination:\n- {unz_dest}\n\n"
                 f"💡 Tip: Click '🎯 Switch to Unzipped' in the Studio toolbar to inspect or re-pack!"
             )
         else:
             msg = (
                 f"Execution Time: {time_str}\n"
-                f"Subfolders Packed: {summary['success']} OK / {summary['skipped']} Skipped\n\n"
-                f"Target Location:\n- {summary['target_dir']}"
+                f"Subfolders Packed: {summary.get('success', 0)} OK / {summary.get('skipped', 0)} Skipped\n\n"
+                f"Target Location:\n- {summary.get('target_dir', '')}"
             )
 
         title = "Execution Aborted" if summary["aborted"] else "Processing Complete"
