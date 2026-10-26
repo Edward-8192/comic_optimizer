@@ -7,10 +7,12 @@ A high-performance comic/manga archive optimizer and folder packer built for mac
 - **Assets**: `7zz` (bundled CLI binary), `app_icon.png` & `app_icon.icns` (macOS Apple-style squircle icons).
 
 ## 2. Core Architecture Rules (DO NOT BREAK)
-1. **Multiprocessing & System Stability**:
+1. **Multiprocessing, Abort Safety & System Stability**:
    - macOS uses the `spawn` start method. Always keep `multiprocessing.freeze_support()` and `multiprocessing.set_start_method("spawn", force=True)` in `__main__` for PyInstaller compatibility.
    - Reserve 1 physical/logical CPU core for macOS, the GUI main thread, and the Multiprocessing Manager (`num_workers = max(1, os.cpu_count() - 1)`).
    - Heavy tasks must run in `QThread` (`OptimizerThread`, `FolderPackerThread`) via `ProcessPoolExecutor` to prevent freezing the GUI.
+   - **Never use `with ProcessPoolExecutor(...) as executor:`** (which calls `shutdown(wait=True)` on exit and blocks Abort while background tasks keep running). Always manage `executor` explicitly and call `terminate_executor_immediately(executor, futures)` on abort (`shutdown(wait=False, cancel_futures=True)` + `pkill -9 -P <pid>` + `p.kill()`), alongside the shared cooperative `abort_flag = manager.Value('b', False)`.
+   - `pack_folder_worker` must write to a temporary `.packing_<name>.tmp` file first and only rename to the final archive upon full completion so aborting never leaves half-written archives or moves the source folder prematurely. Aborted tasks in `worker_task` must return `"ABORTED"` and leave the original archive untouched (never moving it to `Error-` or `FileErr-`).
 2. **CPU Token Pool (Atomic Token Management)**:
    - System cores are managed atomically via `cpu_token_manager = (allocated_cpu_tokens, cpu_token_lock)` to prevent CPU over-subscription when multiple workers resize images simultaneously.
    - Dynamic micro-batching (`CHUNK_SIZE = 24`) borrows cores from both `"Idle"` and `"Queued I/O"` workers dynamically.

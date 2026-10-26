@@ -587,7 +587,7 @@ def resize_and_convert_image(
 
         img.save(dst_path, format="JPEG", quality=jpeg_quality, optimize=True)
 
-def extract_archive_stream(archive_path: Path, extract_dir: Path, progress_callback=None):
+def extract_archive_stream(archive_path: Path, extract_dir: Path, progress_callback=None, abort_flag=None):
     ext = archive_path.suffix.lower()
     start_time = time.time()
     try:
@@ -597,6 +597,8 @@ def extract_archive_stream(archive_path: Path, extract_dir: Path, progress_callb
                     members = zf.infolist()
                     total = len(members)
                     for idx, member in enumerate(members):
+                        if abort_flag is not None and abort_flag.value:
+                            return False, "ABORTED"
                         zf.extract(member, extract_dir)
                         if progress_callback and (idx % 12 == 0 or idx == total - 1):
                             elapsed = time.time() - start_time
@@ -618,6 +620,12 @@ def extract_archive_stream(archive_path: Path, extract_dir: Path, progress_callb
             current_pct = 0.0
             captured_output = []
             while True:
+                if abort_flag is not None and abort_flag.value:
+                    try:
+                        proc.kill()
+                    except Exception:
+                        pass
+                    return False, "ABORTED"
                 line = proc.stdout.readline()
                 if not line and proc.poll() is not None:
                     break
@@ -630,6 +638,8 @@ def extract_archive_stream(archive_path: Path, extract_dir: Path, progress_callb
                 if progress_callback:
                     progress_callback(current_pct, elapsed)
             _, stderr_out = proc.communicate()
+            if abort_flag is not None and abort_flag.value:
+                return False, "ABORTED"
             if proc.returncode == 0:
                 return True, "SUCCESS"
             all_err = "".join(captured_output) + (" " + stderr_out if stderr_out else "")
@@ -640,7 +650,10 @@ def extract_archive_stream(archive_path: Path, extract_dir: Path, progress_callb
         if "No space left on device" in str(e): return False, "NO_SPACE"
         return False, "CORRUPTED"
 
-def create_zip_store(target_archive: Path, file_pairs: list, root_folder_name: str = None, consume_source: bool = False):
+def create_zip_store(
+    target_archive: Path, file_pairs: list, root_folder_name: str = None,
+    consume_source: bool = False, abort_flag=None, progress_callback=None
+):
     if not file_pairs: return
     target_archive.parent.mkdir(parents=True, exist_ok=True)
     file_pairs.sort(key=lambda x: natural_sort_key(x[1]))
@@ -658,8 +671,11 @@ def create_zip_store(target_archive: Path, file_pairs: list, root_folder_name: s
         if has_root_files or len(top_dirs) != 1 or next(iter(top_dirs)) != root_folder_name:
             needs_wrapper = True
 
+    total = len(file_pairs)
     with zipfile.ZipFile(target_archive, 'w', compression=zipfile.ZIP_STORED) as zf:
-        for disk_path, arc_name in file_pairs:
+        for idx, (disk_path, arc_name) in enumerate(file_pairs):
+            if abort_flag is not None and abort_flag.value:
+                raise InterruptedError("ABORTED")
             final_arc_name = f"{root_folder_name}/{arc_name}" if needs_wrapper else arc_name
             zf.write(disk_path, arcname=final_arc_name)
             if consume_source:
@@ -667,6 +683,8 @@ def create_zip_store(target_archive: Path, file_pairs: list, root_folder_name: s
                     Path(disk_path).unlink(missing_ok=True)
                 except Exception:
                     pass
+            if progress_callback and (idx % 15 == 0 or idx == total - 1):
+                progress_callback((idx + 1) / max(1, total))
 
 def safe_move_file(src_path: Path, dst_dir: Path):
     dst_dir.mkdir(parents=True, exist_ok=True)
@@ -729,7 +747,7 @@ def execute_pipeline(
     archive_path, resized_dir, anim_dir, media_dir, original_files_dir,
     temp_target_dir, tier_tag, worker_id, status_dict, cpu_token_manager,
     max_w: int = MAX_WIDTH, max_h: int = MAX_HEIGHT, jpeg_quality: int = JPEG_QUALITY,
-    io_controller=None
+    io_controller=None, abort_flag=None
 ):
     stem_name = archive_path.stem
     allocated_tokens, cpu_token_lock = cpu_token_manager
@@ -759,22 +777,31 @@ def execute_pipeline(
             acquired_read = False
             try:
                 while True:
+                    if abort_flag is not None and abort_flag.value:
+                        return False, "ABORTED", 0, 0
                     with io_lock:
                         if active_io_streams.value < max_io_streams and waiting_writers.value == 0:
                             active_io_streams.value += 1
                             acquired_read = True
                             break
                     time.sleep(0.04)
-                success, reason = extract_archive_stream(archive_path, extracted_dir, update_extract_progress)
+                success, reason = extract_archive_stream(
+                    archive_path, extracted_dir, update_extract_progress, abort_flag=abort_flag
+                )
             finally:
                 if acquired_read:
                     with io_lock:
                         active_io_streams.value = max(0, active_io_streams.value - 1)
         else:
-            success, reason = extract_archive_stream(archive_path, extracted_dir, update_extract_progress)
+            success, reason = extract_archive_stream(
+                archive_path, extracted_dir, update_extract_progress, abort_flag=abort_flag
+            )
 
         if not success:
             return False, reason, 0, 0
+
+        if abort_flag is not None and abort_flag.value:
+            return False, "ABORTED", 0, 0
 
         status_dict[worker_id] = {
             "tier": tier_tag, "stage": "Scanning", "name": archive_path.name,
@@ -810,6 +837,8 @@ def execute_pipeline(
         CHUNK_SIZE = 24
         try:
             for chunk_start in range(0, total_imgs, CHUNK_SIZE):
+                if abort_flag is not None and abort_flag.value:
+                    return False, "ABORTED", 0, 0
                 chunk_tasks = tasks[chunk_start:chunk_start + CHUNK_SIZE]
 
                 borrowed_tokens = 0
@@ -862,38 +891,59 @@ def execute_pipeline(
                 return False, "NO_SPACE", 0, 0
             raise
 
+        if abort_flag is not None and abort_flag.value:
+            return False, "ABORTED", 0, 0
+
         # 階段 3: 在 RAM Disk / Local Temp 內部瞬間封裝好 ZIP/CBZ，並「邊包邊刪」來源暫存檔以保持零重複空間佔用
-        status_dict[worker_id] = {
-            "tier": tier_tag, "stage": "Packaging", "name": archive_path.name,
-            "progress": 0.93, "detail": "RAM Build" if tier_tag == "RAM" else "Local Build"
-        }
+        pkg_label = "RAM Build" if tier_tag == "RAM" else "Local Build"
+        def update_pkg_progress(ratio: float):
+            status_dict[worker_id] = {
+                "tier": tier_tag, "stage": "Packaging", "name": archive_path.name,
+                "progress": 0.90 + (0.06 * ratio), "detail": f"{pkg_label} ({int(ratio * 100)}%)"
+            }
+
+        update_pkg_progress(0.0)
         out_bytes = 0
         staged_moves = []
         try:
             if processed_images:
                 staged_main = staged_out_dir / f"{stem_name}{ARCHIVE_MAIN_EXT}"
-                create_zip_store(staged_main, processed_images, consume_source=True)
+                create_zip_store(
+                    staged_main, processed_images, consume_source=True,
+                    abort_flag=abort_flag, progress_callback=update_pkg_progress
+                )
                 if staged_main.exists():
                     out_bytes += staged_main.stat().st_size
                     staged_moves.append((staged_main, resized_dir))
             if animated_images:
                 staged_anim = staged_out_dir / f"{stem_name}-Animated{ARCHIVE_OTHER_EXT}"
-                create_zip_store(staged_anim, animated_images, root_folder_name=f"{stem_name}-Animated", consume_source=True)
+                create_zip_store(
+                    staged_anim, animated_images, root_folder_name=f"{stem_name}-Animated",
+                    consume_source=True, abort_flag=abort_flag
+                )
                 if staged_anim.exists():
                     out_bytes += staged_anim.stat().st_size
                     staged_moves.append((staged_anim, anim_dir))
             if media_files:
                 staged_media = staged_out_dir / f"{stem_name}-Media{ARCHIVE_OTHER_EXT}"
-                create_zip_store(staged_media, media_files, root_folder_name=f"{stem_name}-Media", consume_source=True)
+                create_zip_store(
+                    staged_media, media_files, root_folder_name=f"{stem_name}-Media",
+                    consume_source=True, abort_flag=abort_flag
+                )
                 if staged_media.exists():
                     out_bytes += staged_media.stat().st_size
                     staged_moves.append((staged_media, media_dir))
             shutil.rmtree(extracted_dir, ignore_errors=True)
             shutil.rmtree(processed_dir_tmp, ignore_errors=True)
+        except InterruptedError:
+            return False, "ABORTED", 0, 0
         except OSError as e:
             if e.errno == 28 or "No space left on device" in str(e):
                 return False, "NO_SPACE", 0, 0
             raise
+
+        if abort_flag is not None and abort_flag.value:
+            return False, "ABORTED", 0, 0
 
         # 階段 4: 組裝完畢後透過最高優先權 (Write-Priority) 立刻搬往目的地資料夾，瞬間騰出 RAM Disk
         def _flush_to_disk():
@@ -916,6 +966,8 @@ def execute_pipeline(
                     "progress": 0.96, "detail": "Priority Flush"
                 }
                 while True:
+                    if abort_flag is not None and abort_flag.value:
+                        return False, "ABORTED", 0, 0
                     with io_lock:
                         if active_io_streams.value < max_io_streams:
                             active_io_streams.value += 1
@@ -941,7 +993,7 @@ def worker_task(
     original_files_dir_str: str, error_dir_str: str, file_err_dir_str: str,
     worker_id: int, status_dict, recent_logs, ram_manager_tuple, cpu_token_manager,
     max_w: int = MAX_WIDTH, max_h: int = MAX_HEIGHT, jpeg_quality: int = JPEG_QUALITY,
-    io_controller=None, strict_ram: bool = True
+    io_controller=None, strict_ram: bool = True, abort_flag=None
 ):
     archive_path = Path(archive_path_str)
     resized_dir = Path(resized_dir_str)
@@ -963,11 +1015,20 @@ def worker_task(
     start_task_time = time.time()
     clean_name = sanitize_log_text(archive_path.name)
     try:
+        if abort_flag is not None and abort_flag.value:
+            status_dict[worker_id] = {"tier": "-", "stage": "Idle", "name": "-", "progress": 0.0, "detail": ""}
+            return archive_path_str, "ABORTED", 0.0, 0, orig_bytes, 0
+
         ok, reason, img_count, out_bytes = execute_pipeline(
             archive_path, resized_dir, anim_dir, media_dir, original_files_dir,
             temp_target_dir, tier_tag, worker_id, status_dict, cpu_token_manager,
-            max_w=max_w, max_h=max_h, jpeg_quality=jpeg_quality, io_controller=io_controller
+            max_w=max_w, max_h=max_h, jpeg_quality=jpeg_quality, io_controller=io_controller,
+            abort_flag=abort_flag
         )
+
+        if not ok and (reason == "ABORTED" or (abort_flag is not None and abort_flag.value)):
+            status_dict[worker_id] = {"tier": "-", "stage": "Idle", "name": "-", "progress": 0.0, "detail": ""}
+            return archive_path_str, "ABORTED", time.time() - start_task_time, 0, orig_bytes, 0
 
         if not ok and reason == "NO_SPACE" and temp_target_dir is not None:
             if strict_ram:
@@ -981,8 +1042,12 @@ def worker_task(
                 ok, reason, img_count, out_bytes = execute_pipeline(
                     archive_path, resized_dir, anim_dir, media_dir, original_files_dir,
                     None, tier_tag, worker_id, status_dict, cpu_token_manager,
-                    max_w=max_w, max_h=max_h, jpeg_quality=jpeg_quality, io_controller=io_controller
+                    max_w=max_w, max_h=max_h, jpeg_quality=jpeg_quality, io_controller=io_controller,
+                    abort_flag=abort_flag
                 )
+                if not ok and (reason == "ABORTED" or (abort_flag is not None and abort_flag.value)):
+                    status_dict[worker_id] = {"tier": "-", "stage": "Idle", "name": "-", "progress": 0.0, "detail": ""}
+                    return archive_path_str, "ABORTED", time.time() - start_task_time, 0, orig_bytes, 0
                 if not ok:
                     safe_move_file(archive_path, error_dir)
                     recent_logs.append(("SYS_ERR", clean_name, "Retry Failed"))
@@ -1010,19 +1075,30 @@ def worker_task(
     status_dict[worker_id] = {"tier": tier_tag, "stage": "Idle", "name": "-", "progress": 0.0, "detail": ""}
     return archive_path_str, "SUCCESS", total_cost, img_count, orig_bytes, out_bytes
 
-def pack_folder_worker(folder_path_str: str, out_ext: str, worker_id: int, status_dict, recent_logs, move_to_orig_dir_str: str = None):
+def pack_folder_worker(
+    folder_path_str: str, out_ext: str, worker_id: int,
+    status_dict, recent_logs, move_to_orig_dir_str: str = None, abort_flag=None
+):
+    if abort_flag is not None and abort_flag.value:
+        status_dict[worker_id] = {"tier": "-", "stage": "Idle", "name": "-", "progress": 0.0, "detail": ""}
+        return folder_path_str, "ABORTED"
+
     folder_path = Path(folder_path_str)
     target_archive = folder_path.parent / f"{folder_path.name}{out_ext}"
+    temp_archive = folder_path.parent / f".packing_{folder_path.name}{out_ext}.tmp"
     start_time = time.time()
 
     clean_name = sanitize_log_text(folder_path.name)
     status_dict[worker_id] = {
         "tier": "DISK", "stage": "Packing", "name": clean_name,
-        "progress": 0.1, "detail": "Listing"
+        "progress": 0.05, "detail": "Listing"
     }
 
     file_pairs = []
     for root, _, files in os.walk(folder_path):
+        if abort_flag is not None and abort_flag.value:
+            status_dict[worker_id] = {"tier": "-", "stage": "Idle", "name": "-", "progress": 0.0, "detail": ""}
+            return folder_path_str, "ABORTED"
         for f in files:
             if f.startswith("._") or f == ".DS_Store":
                 continue
@@ -1036,15 +1112,37 @@ def pack_folder_worker(folder_path_str: str, out_ext: str, worker_id: int, statu
         return folder_path_str, "SKIP"
 
     total_files = len(file_pairs)
-    status_dict[worker_id] = {
-        "tier": "DISK", "stage": "Storing", "name": clean_name,
-        "progress": 0.4, "detail": f"{total_files} Files"
-    }
-
     file_pairs.sort(key=lambda x: natural_sort_key(x[1]))
-    with zipfile.ZipFile(target_archive, 'w', compression=zipfile.ZIP_STORED) as zf:
-        for fp, arc_name in file_pairs:
-            zf.write(fp, arcname=arc_name)
+
+    try:
+        with zipfile.ZipFile(temp_archive, 'w', compression=zipfile.ZIP_STORED) as zf:
+            for idx, (fp, arc_name) in enumerate(file_pairs):
+                if abort_flag is not None and abort_flag.value:
+                    raise InterruptedError("ABORTED")
+                zf.write(fp, arcname=arc_name)
+                if idx % 10 == 0 or idx == total_files - 1:
+                    pct = 0.10 + (0.85 * ((idx + 1) / max(1, total_files)))
+                    status_dict[worker_id] = {
+                        "tier": "DISK", "stage": "Storing", "name": clean_name,
+                        "progress": pct, "detail": f"{idx + 1}/{total_files}F"
+                    }
+    except BaseException:
+        try:
+            temp_archive.unlink(missing_ok=True)
+        except Exception:
+            pass
+        status_dict[worker_id] = {"tier": "-", "stage": "Idle", "name": "-", "progress": 0.0, "detail": ""}
+        return folder_path_str, "ABORTED"
+
+    if abort_flag is not None and abort_flag.value:
+        try:
+            temp_archive.unlink(missing_ok=True)
+        except Exception:
+            pass
+        status_dict[worker_id] = {"tier": "-", "stage": "Idle", "name": "-", "progress": 0.0, "detail": ""}
+        return folder_path_str, "ABORTED"
+
+    temp_archive.replace(target_archive)
 
     if move_to_orig_dir_str:
         orig_dest = Path(move_to_orig_dir_str)
@@ -1054,6 +1152,34 @@ def pack_folder_worker(folder_path_str: str, out_ext: str, worker_id: int, statu
     recent_logs.append(("OK", clean_name, f"Packed ({cost:.1f}s, {total_files}F)"))
     status_dict[worker_id] = {"tier": "-", "stage": "Idle", "name": "-", "progress": 0.0, "detail": ""}
     return folder_path_str, "SUCCESS"
+
+def terminate_executor_immediately(executor: ProcessPoolExecutor, futures_iterable=()):
+    """立即取消未執行任務並強制終止所有 Worker 行程及其衍生子行程 (如 7zz)，不阻塞等待"""
+    for f in list(futures_iterable):
+        try:
+            f.cancel()
+        except Exception:
+            pass
+    procs = []
+    if hasattr(executor, "_processes") and executor._processes:
+        procs = list(executor._processes.values())
+    for p in procs:
+        try:
+            if p.pid:
+                subprocess.run(["pkill", "-9", "-P", str(p.pid)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            p.terminate()
+        except Exception:
+            pass
+    try:
+        executor.shutdown(wait=False, cancel_futures=True)
+    except Exception:
+        pass
+    for p in procs:
+        try:
+            if p.is_alive():
+                p.kill()
+        except Exception:
+            pass
 
 # ==================== Background Threads ====================
 class OptimizerThread(QThread):
@@ -1079,19 +1205,57 @@ class OptimizerThread(QThread):
         self.jpeg_quality = jpeg_quality
         self.io_limit = max(1, io_limit)
         self.is_aborted = False
+        self.abort_flag = None
 
     def abort(self):
         self.is_aborted = True
+        if self.abort_flag is not None:
+            try:
+                self.abort_flag.value = True
+            except Exception:
+                pass
+
+    def _cleanup_leftover_tmp_packs(self):
+        for s_dir in self.source_dirs:
+            try:
+                for p in s_dir.glob(".packing_*.tmp"):
+                    p.unlink(missing_ok=True)
+            except Exception:
+                pass
 
     def run(self):
+        global_start_time = time.time()
         today_str = datetime.now().strftime("%Y-%m-%d")
         num_workers = max(1, os.cpu_count() - 1)
         manager = multiprocessing.Manager()
+        self.abort_flag = manager.Value('b', self.is_aborted)
         worker_statuses = manager.dict()
         recent_logs = manager.list()
         file_err_stems = manager.list()
         for i in range(num_workers):
             worker_statuses[i] = {"tier": "-", "stage": "Idle", "name": "-", "progress": 0.0, "detail": ""}
+
+        out_loc_desc = str(self.global_output_dir) if self.global_output_dir else "Respective source folders"
+
+        def _emit_early_abort(total_f=0):
+            self._cleanup_leftover_tmp_packs()
+            for i in range(num_workers):
+                worker_statuses[i] = {"tier": "-", "stage": "Idle", "name": "-", "progress": 0.0, "detail": ""}
+            self.worker_signal.emit(dict(worker_statuses))
+            self.log_signal.emit(list(recent_logs))
+            self.finished_signal.emit({
+                "mode": "optimizer",
+                "total_time": time.time() - global_start_time,
+                "total_files": total_f,
+                "success": 0,
+                "corrupted": 0,
+                "error": 0,
+                "aborted": True,
+                "out_loc": out_loc_desc,
+                "source_count": len(self.source_dirs),
+                "orig_bytes": 0,
+                "out_bytes": 0
+            })
 
         # === 步驟 1: 對所有來源資料夾分別執行前置 Quick Folder Packer ===
         all_pre_sub_dirs = []
@@ -1108,23 +1272,40 @@ class OptimizerThread(QThread):
         if all_pre_sub_dirs and not self.is_aborted:
             recent_logs.append(("INFO", "Pre-pack", f"Found {len(all_pre_sub_dirs)} subfolders across {len(self.source_dirs)} sources"))
             self.log_signal.emit(list(recent_logs))
-            with ProcessPoolExecutor(max_workers=num_workers) as pack_executor:
-                pack_futures = {}
-                for idx, (folder, orig_dest) in enumerate(all_pre_sub_dirs):
-                    wid = idx % num_workers
-                    f = pack_executor.submit(
-                        pack_folder_worker, str(folder), ".zip", wid,
-                        worker_statuses, recent_logs, str(orig_dest)
-                    )
-                    pack_futures[f] = folder
+            pre_queue = list(all_pre_sub_dirs)
+            pre_avail_workers = set(range(min(num_workers, self.io_limit)))
+            pack_futures = {}
+            pre_done = 0
+            pack_executor = ProcessPoolExecutor(max_workers=min(num_workers, self.io_limit))
+            try:
+                while (pre_queue or pack_futures) and not self.is_aborted:
+                    done_pf = [f for f in pack_futures if f.done()]
+                    for f in done_pf:
+                        wid = pack_futures.pop(f)
+                        pre_avail_workers.add(wid)
+                        pre_done += 1
+                        self.progress_signal.emit(pre_done, len(all_pre_sub_dirs))
 
-                for f in as_completed(pack_futures):
-                    if self.is_aborted:
-                        break
+                    while pre_avail_workers and pre_queue and not self.is_aborted:
+                        folder, orig_dest = pre_queue.pop(0)
+                        wid = pre_avail_workers.pop()
+                        f = pack_executor.submit(
+                            pack_folder_worker, str(folder), ".zip", wid,
+                            worker_statuses, recent_logs, str(orig_dest), self.abort_flag
+                        )
+                        pack_futures[f] = wid
+
                     self.worker_signal.emit(dict(worker_statuses))
                     self.log_signal.emit(list(recent_logs))
+                    time.sleep(0.1)
+            finally:
+                if self.is_aborted:
+                    terminate_executor_immediately(pack_executor, pack_futures.keys())
+                else:
+                    pack_executor.shutdown(wait=True)
 
         if self.is_aborted:
+            _emit_early_abort(0)
             return
 
         # === 步驟 2: 掃描所有來源資料夾底下的待處理壓縮檔 ===
@@ -1164,17 +1345,20 @@ class OptimizerThread(QThread):
         with ThreadPoolExecutor(max_workers=max_inspect_threads) as inspector:
             futures = [inspector.submit(inspect_archive_worker, item) for item in archive_items]
             for f in as_completed(futures):
-                if self.is_aborted: break
+                if self.is_aborted:
+                    for pending_f in futures:
+                        pending_f.cancel()
+                    break
                 try: pending_queue.append(f.result())
                 except Exception: pass
 
         if self.is_aborted:
             if ram_active: cleanup_ram_disk()
+            _emit_early_abort(len(archive_items))
             return
 
         pending_queue.sort(key=lambda x: x["uncompressed_mb"], reverse=True)
 
-        global_start_time = time.time()
         success_count = 0
         fail_err_count = 0
         corrupted_count = 0
@@ -1184,165 +1368,172 @@ class OptimizerThread(QThread):
 
         available_workers = set(range(num_workers))
         active_futures = {}
+        executor = ProcessPoolExecutor(max_workers=num_workers)
 
         try:
-            with ProcessPoolExecutor(max_workers=num_workers) as executor:
-                while (pending_queue or active_futures) and not self.is_aborted:
-                    done_futures = [f for f in active_futures if f.done()]
-                    for f in done_futures:
-                        task_meta = active_futures.pop(f)
-                        worker_id = task_meta["wid"]
-                        src_root_str = task_meta["src_root"]
-                        dest_root_str = task_meta["dest_root"]
-                        orig_item = task_meta["item"]
-                        available_workers.add(worker_id)
-                        try:
-                            arch_path_done, result_code, cost_sec, page_cnt, f_orig_b, f_out_b = f.result()
-                            if result_code == "RETRY_RAM":
-                                # 強制 RAM Disk 模式下若發生空間不足，調高該檔預留額度並排回佇列最前端重新在 RAM Disk 執行
-                                orig_item["ram_oom_retries"] = orig_item.get("ram_oom_retries", 0) + 1
-                                if orig_item["ram_oom_retries"] >= 3:
-                                    orig_item["force_ssd"] = True
-                                    recent_logs.append(("WARN", sanitize_log_text(orig_item["path"].name), "Exceeds Total RAM -> SSD"))
-                                else:
-                                    orig_item["uncompressed_mb"] = min(
-                                        ram_budget_mb,
-                                        max(orig_item["uncompressed_mb"] * 1.25, ram_budget_mb * 0.5)
-                                    )
-                                pending_queue.insert(0, orig_item)
-                                continue
-
-                            done_total += 1
-                            arch_name = Path(arch_path_done).name
-                            if result_code == "SUCCESS":
-                                success_count += 1
-                                session_orig_bytes += f_orig_b
-                                session_out_bytes += f_out_b
-                            elif result_code == "FILE_ERR":
-                                corrupted_count += 1
-                                file_err_stems.append(Path(arch_path_done).stem)
+            while (pending_queue or active_futures) and not self.is_aborted:
+                done_futures = [f for f in active_futures if f.done()]
+                for f in done_futures:
+                    task_meta = active_futures.pop(f)
+                    worker_id = task_meta["wid"]
+                    src_root_str = task_meta["src_root"]
+                    dest_root_str = task_meta["dest_root"]
+                    orig_item = task_meta["item"]
+                    available_workers.add(worker_id)
+                    try:
+                        arch_path_done, result_code, cost_sec, page_cnt, f_orig_b, f_out_b = f.result()
+                        if result_code == "ABORTED":
+                            continue
+                        if result_code == "RETRY_RAM":
+                            # 強制 RAM Disk 模式下若發生空間不足，調高該檔預留額度並排回佇列最前端重新在 RAM Disk 執行
+                            orig_item["ram_oom_retries"] = orig_item.get("ram_oom_retries", 0) + 1
+                            if orig_item["ram_oom_retries"] >= 3:
+                                orig_item["force_ssd"] = True
+                                recent_logs.append(("WARN", sanitize_log_text(orig_item["path"].name), "Exceeds Total RAM -> SSD"))
                             else:
-                                fail_err_count += 1
+                                orig_item["uncompressed_mb"] = min(
+                                    ram_budget_mb,
+                                    max(orig_item["uncompressed_mb"] * 1.25, ram_budget_mb * 0.5)
+                                )
+                            pending_queue.insert(0, orig_item)
+                            continue
 
-                            HistoryDatabase.add_record(
-                                filename=arch_name,
-                                source_dir=src_root_str,
-                                output_dir=dest_root_str,
-                                status=result_code,
-                                page_count=page_cnt,
-                                orig_bytes=f_orig_b,
-                                out_bytes=f_out_b,
-                                duration_sec=cost_sec
-                            )
-                        except Exception:
+                        done_total += 1
+                        arch_name = Path(arch_path_done).name
+                        if result_code == "SUCCESS":
+                            success_count += 1
+                            session_orig_bytes += f_orig_b
+                            session_out_bytes += f_out_b
+                        elif result_code == "FILE_ERR":
+                            corrupted_count += 1
+                            file_err_stems.append(Path(arch_path_done).stem)
+                        else:
+                            fail_err_count += 1
+
+                        HistoryDatabase.add_record(
+                            filename=arch_name,
+                            source_dir=src_root_str,
+                            output_dir=dest_root_str,
+                            status=result_code,
+                            page_count=page_cnt,
+                            orig_bytes=f_orig_b,
+                            out_bytes=f_out_b,
+                            duration_sec=cost_sec
+                        )
+                    except Exception:
+                        if not self.is_aborted:
                             done_total += 1
                             fail_err_count += 1
-                        self.progress_signal.emit(done_total, len(archive_items))
+                    self.progress_signal.emit(done_total, len(archive_items))
 
-                    while available_workers and pending_queue and not self.is_aborted:
-                        # 按需串流派發 (Just-In-Time Stream Dispatch)：
-                        # 當有任務正在寫出釋放 RAM Disk，或正在讀取解壓的串流數已達 io_limit 時，
-                        # 不提前把多餘任務塞進 Waiting Disk 預佔 RAM Disk 空間，讓閒置核心專心支援 Resizing！
-                        if waiting_writers.value > 0:
+                while available_workers and pending_queue and not self.is_aborted:
+                    # 按需串流派發 (Just-In-Time Stream Dispatch)：
+                    # 當有任務正在寫出釋放 RAM Disk，或正在讀取解壓的串流數已達 io_limit 時，
+                    # 不提前把多餘任務塞進 Waiting Disk 預佔 RAM Disk 空間，讓閒置核心專心支援 Resizing！
+                    if waiting_writers.value > 0:
+                        break
+                    active_wids = [m["wid"] for m in active_futures.values()]
+                    active_readers = sum(
+                        1 for wid in active_wids
+                        if worker_statuses.get(wid, {}).get("stage") in ("Queued I/O", "Extracting")
+                        and worker_statuses.get(wid, {}).get("progress", 0.0) < 0.25
+                    )
+                    if active_readers >= self.io_limit:
+                        break
+
+                    assigned = False
+                    for idx, item in enumerate(pending_queue):
+                        needed_mb = item["uncompressed_mb"]
+                        exceeds_physical_ram = (needed_mb > ram_total_mb) if self.strict_ram else (needed_mb > ram_budget_mb)
+                        if not ram_active or item.get("force_ssd", False) or exceeds_physical_ram:
+                            target_tier = "SSD"
+                            reserved_mb = 0.0
+                            chosen_item = pending_queue.pop(idx)
+                            assigned = True
                             break
-                        active_wids = [m["wid"] for m in active_futures.values()]
-                        active_readers = sum(
-                            1 for wid in active_wids
-                            if worker_statuses.get(wid, {}).get("stage") in ("Queued I/O", "Extracting")
-                            and worker_statuses.get(wid, {}).get("progress", 0.0) < 0.25
-                        )
-                        if active_readers >= self.io_limit:
-                            break
 
-                        assigned = False
-                        for idx, item in enumerate(pending_queue):
-                            needed_mb = item["uncompressed_mb"]
-                            exceeds_physical_ram = (needed_mb > ram_total_mb) if self.strict_ram else (needed_mb > ram_budget_mb)
-                            if not ram_active or item.get("force_ssd", False) or exceeds_physical_ram:
-                                target_tier = "SSD"
-                                reserved_mb = 0.0
-                                chosen_item = pending_queue.pop(idx)
-                                assigned = True
-                                break
-
-                            effective_needed_mb = min(needed_mb, ram_budget_mb)
-                            can_allocate = False
-                            with ram_lock:
-                                actual_free_mb = get_ram_disk_free_mb()
-                                if current_allocated_ram.value <= 0.01:
-                                    # 當 RAM Disk 處於淨空狀態時，任何小於 RAM Disk 總容量的檔案皆可直接進駐
-                                    if actual_free_mb >= min(effective_needed_mb * 0.90, ram_budget_mb * 0.90):
-                                        current_allocated_ram.value += effective_needed_mb
-                                        can_allocate = True
-                                else:
-                                    # 雙重空間檢核：帳面預留與實體剩餘空間皆足夠才放行
-                                    if (current_allocated_ram.value + effective_needed_mb <= ram_budget_mb) and (actual_free_mb >= effective_needed_mb):
-                                        current_allocated_ram.value += effective_needed_mb
-                                        can_allocate = True
-
-                            if can_allocate:
-                                target_tier = "RAM"
-                                reserved_mb = effective_needed_mb
-                                chosen_item = pending_queue.pop(idx)
-                                assigned = True
-                                break
+                        effective_needed_mb = min(needed_mb, ram_budget_mb)
+                        can_allocate = False
+                        with ram_lock:
+                            actual_free_mb = get_ram_disk_free_mb()
+                            if current_allocated_ram.value <= 0.01:
+                                # 當 RAM Disk 處於淨空狀態時，任何小於 RAM Disk 總容量的檔案皆可直接進駐
+                                if actual_free_mb >= min(effective_needed_mb * 0.90, ram_budget_mb * 0.90):
+                                    current_allocated_ram.value += effective_needed_mb
+                                    can_allocate = True
                             else:
-                                if self.strict_ram:
-                                    continue
-                                else:
-                                    if idx == 0:
-                                        item["retries"] += 1
-                                    if item["retries"] >= MAX_RAM_RETRIES:
-                                        target_tier = "SSD"
-                                        reserved_mb = 0.0
-                                        chosen_item = pending_queue.pop(idx)
-                                        assigned = True
-                                        break
+                                # 雙重空間檢核：帳面預留與實體剩餘空間皆足夠才放行
+                                if (current_allocated_ram.value + effective_needed_mb <= ram_budget_mb) and (actual_free_mb >= effective_needed_mb):
+                                    current_allocated_ram.value += effective_needed_mb
+                                    can_allocate = True
 
-                        if assigned:
-                            worker_id = available_workers.pop()
-                            # 立即標記為 Queued I/O，確保迴圈能精確統計 active_readers
-                            worker_statuses[worker_id] = {
-                                "tier": target_tier, "stage": "Queued I/O",
-                                "name": chosen_item["path"].name, "progress": 0.0, "detail": "Starting"
-                            }
-                            # 動態計算該檔案的產出目錄
-                            src_root = chosen_item["src_root"]
-                            dest_root = self.global_output_dir if self.global_output_dir else src_root
-                            
-                            resized_dir = dest_root / f"Resized-{today_str}"
-                            anim_dir = dest_root / f"Animated-{today_str}"
-                            media_dir = dest_root / f"Media-{today_str}"
-                            error_dir = dest_root / f"Error-{today_str}"
-                            file_err_dir = dest_root / f"FileErr-{today_str}"
-                            # 原檔固定搬移到原本所屬資料夾
-                            original_files_dir = src_root / f"OriginalFiles-{today_str}"
-
-                            f = executor.submit(
-                                worker_task, str(chosen_item["path"]), target_tier, reserved_mb,
-                                str(resized_dir), str(anim_dir), str(media_dir),
-                                str(original_files_dir), str(error_dir), str(file_err_dir),
-                                worker_id, worker_statuses, recent_logs, ram_manager_tuple, cpu_token_manager,
-                                self.max_w, self.max_h, self.jpeg_quality, io_controller, self.strict_ram
-                            )
-                            active_futures[f] = {
-                                "wid": worker_id,
-                                "src_root": str(src_root),
-                                "dest_root": str(dest_root),
-                                "item": chosen_item
-                            }
-                        else:
+                        if can_allocate:
+                            target_tier = "RAM"
+                            reserved_mb = effective_needed_mb
+                            chosen_item = pending_queue.pop(idx)
+                            assigned = True
                             break
+                        else:
+                            if self.strict_ram:
+                                continue
+                            else:
+                                if idx == 0:
+                                    item["retries"] += 1
+                                if item["retries"] >= MAX_RAM_RETRIES:
+                                    target_tier = "SSD"
+                                    reserved_mb = 0.0
+                                    chosen_item = pending_queue.pop(idx)
+                                    assigned = True
+                                    break
 
-                    self.worker_signal.emit(dict(worker_statuses))
-                    self.log_signal.emit(list(recent_logs))
-                    time.sleep(0.1)
+                    if assigned:
+                        worker_id = available_workers.pop()
+                        # 立即標記為 Queued I/O，確保迴圈能精確統計 active_readers
+                        worker_statuses[worker_id] = {
+                            "tier": target_tier, "stage": "Queued I/O",
+                            "name": chosen_item["path"].name, "progress": 0.0, "detail": "Starting"
+                        }
+                        # 動態計算該檔案的產出目錄
+                        src_root = chosen_item["src_root"]
+                        dest_root = self.global_output_dir if self.global_output_dir else src_root
+                        
+                        resized_dir = dest_root / f"Resized-{today_str}"
+                        anim_dir = dest_root / f"Animated-{today_str}"
+                        media_dir = dest_root / f"Media-{today_str}"
+                        error_dir = dest_root / f"Error-{today_str}"
+                        file_err_dir = dest_root / f"FileErr-{today_str}"
+                        # 原檔固定搬移到原本所屬資料夾
+                        original_files_dir = src_root / f"OriginalFiles-{today_str}"
 
-                if self.is_aborted:
-                    for p in executor._processes.values():
-                        try: p.terminate()
-                        except Exception: pass
+                        f = executor.submit(
+                            worker_task, str(chosen_item["path"]), target_tier, reserved_mb,
+                            str(resized_dir), str(anim_dir), str(media_dir),
+                            str(original_files_dir), str(error_dir), str(file_err_dir),
+                            worker_id, worker_statuses, recent_logs, ram_manager_tuple, cpu_token_manager,
+                            self.max_w, self.max_h, self.jpeg_quality, io_controller, self.strict_ram,
+                            self.abort_flag
+                        )
+                        active_futures[f] = {
+                            "wid": worker_id,
+                            "src_root": str(src_root),
+                            "dest_root": str(dest_root),
+                            "item": chosen_item
+                        }
+                    else:
+                        break
+
+                self.worker_signal.emit(dict(worker_statuses))
+                self.log_signal.emit(list(recent_logs))
+                time.sleep(0.1)
         finally:
+            if self.is_aborted:
+                terminate_executor_immediately(executor, active_futures.keys())
+            else:
+                executor.shutdown(wait=True)
+            for i in range(num_workers):
+                worker_statuses[i] = {"tier": "-", "stage": "Idle", "name": "-", "progress": 0.0, "detail": ""}
+            self.worker_signal.emit(dict(worker_statuses))
+            self.log_signal.emit(list(recent_logs))
             if ram_active:
                 cleanup_ram_disk()
 
@@ -1380,10 +1571,6 @@ class OptimizerThread(QThread):
         # 空間統計計算 (以本次執行實際處理的檔案大小為準)
         total_orig_bytes = session_orig_bytes
         total_out_bytes = session_out_bytes
-        if self.global_output_dir:
-            out_loc_desc = str(self.global_output_dir)
-        else:
-            out_loc_desc = "Respective source folders"
 
         summary_payload = {
             "mode": "optimizer",
@@ -1412,9 +1599,22 @@ class FolderPackerThread(QThread):
         self.source_dir = Path(source_dir_str)
         self.out_ext = out_ext
         self.is_aborted = False
+        self.abort_flag = None
 
     def abort(self):
         self.is_aborted = True
+        if self.abort_flag is not None:
+            try:
+                self.abort_flag.value = True
+            except Exception:
+                pass
+
+    def _cleanup_leftover_tmp_packs(self):
+        try:
+            for p in self.source_dir.glob(".packing_*.tmp"):
+                p.unlink(missing_ok=True)
+        except Exception:
+            pass
 
     def run(self):
         sub_dirs = []
@@ -1435,6 +1635,7 @@ class FolderPackerThread(QThread):
         num_workers = max(1, os.cpu_count() - 1)
 
         manager = multiprocessing.Manager()
+        self.abort_flag = manager.Value('b', self.is_aborted)
         worker_statuses = manager.dict()
         recent_logs = manager.list()
         for i in range(num_workers):
@@ -1448,42 +1649,49 @@ class FolderPackerThread(QThread):
         pending_queue = list(sub_dirs)
         available_workers = set(range(num_workers))
         active_futures = {}
+        executor = ProcessPoolExecutor(max_workers=num_workers)
 
         try:
-            with ProcessPoolExecutor(max_workers=num_workers) as executor:
-                while (pending_queue or active_futures) and not self.is_aborted:
-                    done_futures = [f for f in active_futures if f.done()]
-                    for f in done_futures:
-                        worker_id = active_futures.pop(f)
-                        available_workers.add(worker_id)
+            while (pending_queue or active_futures) and not self.is_aborted:
+                done_futures = [f for f in active_futures if f.done()]
+                for f in done_futures:
+                    worker_id = active_futures.pop(f)
+                    available_workers.add(worker_id)
+                    try:
+                        _, code = f.result()
+                        if code == "ABORTED":
+                            continue
                         done_total += 1
-                        try:
-                            _, code = f.result()
-                            if code == "SUCCESS": success_count += 1
-                            else: skip_count += 1
-                        except Exception:
+                        if code == "SUCCESS": success_count += 1
+                        else: skip_count += 1
+                    except Exception:
+                        if not self.is_aborted:
+                            done_total += 1
                             skip_count += 1
-                        self.progress_signal.emit(done_total, len(sub_dirs))
+                    self.progress_signal.emit(done_total, len(sub_dirs))
 
-                    while available_workers and pending_queue and not self.is_aborted:
-                        chosen_folder = pending_queue.pop(0)
-                        worker_id = available_workers.pop()
-                        f = executor.submit(
-                            pack_folder_worker, str(chosen_folder), self.out_ext,
-                            worker_id, worker_statuses, recent_logs, None
-                        )
-                        active_futures[f] = worker_id
+                while available_workers and pending_queue and not self.is_aborted:
+                    chosen_folder = pending_queue.pop(0)
+                    worker_id = available_workers.pop()
+                    f = executor.submit(
+                        pack_folder_worker, str(chosen_folder), self.out_ext,
+                        worker_id, worker_statuses, recent_logs, None, self.abort_flag
+                    )
+                    active_futures[f] = worker_id
 
-                    self.worker_signal.emit(dict(worker_statuses))
-                    self.log_signal.emit(list(recent_logs))
-                    time.sleep(0.1)
-
-                if self.is_aborted:
-                    for p in executor._processes.values():
-                        try: p.terminate()
-                        except Exception: pass
+                self.worker_signal.emit(dict(worker_statuses))
+                self.log_signal.emit(list(recent_logs))
+                time.sleep(0.1)
         finally:
-            pass
+            if self.is_aborted:
+                terminate_executor_immediately(executor, active_futures.keys())
+                self._cleanup_leftover_tmp_packs()
+            else:
+                executor.shutdown(wait=True)
+            for i in range(num_workers):
+                worker_statuses[i] = {"tier": "-", "stage": "Idle", "name": "-", "progress": 0.0, "detail": ""}
+            self.worker_signal.emit(dict(worker_statuses))
+            self.log_signal.emit(list(recent_logs))
 
         total_cost = time.time() - global_start_time
         summary_payload = {
@@ -1594,6 +1802,9 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event: QCloseEvent):
         self.save_user_settings()
+        if self.worker_thread and self.worker_thread.isRunning():
+            self.worker_thread.abort()
+            self.worker_thread.wait(2500)
         super().closeEvent(event)
 
     def dragEnterEvent(self, event: QDragEnterEvent):
