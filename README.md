@@ -1,140 +1,118 @@
 # Comic Optimizer & Fast Packer (macOS)
 
-專為 **macOS (Apple Silicon M1/M2/M3/M4/M5)** 打造的高效能漫畫／圖集壓縮檔最佳化與快速封裝工具。結合 **RAM Disk 零膨脹記憶體磁碟管線**、**動態 CPU 核心借調 (Dynamic Core Borrowing)** 與 **外接硬碟／RAID I/O 優先順序閘門 (Write-Priority Disk I/O Gatekeeper)**，在保護系統 SSD 壽命與避免外接磁碟陣列讀寫卡死的同時，發揮極致的多核心轉檔效能。
+專為 macOS（Apple Silicon 最佳化）設計的高效能漫畫與圖集自動化處理工具。結合 **PyQt6 現代深色介面**、**動態 RAM Disk 分級排程**與**多核心非阻塞流水線**，提供批次縮圖減肥、資料夾零壓縮封裝（`zip -0`），以及多格式壓縮檔智慧解壓功能。
 
 ---
 
-## ✨ 核心特色
+## 核心特色
 
-- **⚡ 智慧 RAM Disk 零膨脹管線 (Rolling Unlink Pipeline)**：
-  - 自動掛載 macOS 記憶體磁碟 (`/Volumes/ComicRamDisk`)，在記憶體內高速完成解壓縮、縮圖與 `.cbz` 封裝。
-  - 採用**「邊轉邊刪、邊包邊刪」**機制，單一任務在 RAM Disk 內的空間佔用峰值不超過原始解壓大小的 100%，徹底消除暫存空間翻倍問題。
-  - 支援 **Strict RAM（強制於 RAM Disk 執行）** 雙重空間檢核（帳面預留 + 實體剩餘空間），確保檔案不會因瞬時空間吃緊而偷跑至系統 SSD。
-- **💿 外接陣列／硬碟友善的 I/O 優先閘門 (Write-Priority Disk I/O Gatekeeper)**：
-  - 可自訂 **Disk I/O Limit（同時讀寫串流數，預設 `3 Streams`）**，防止傳統機械硬碟 (HDD)、NAS 或外接 RAID 陣列（如 QNAP TR-002）因 14 核心同時隨機讀寫而尋道卡死 (Disk Thrashing)。
-  - **組裝完即刻搬移 (Priority Flush)**：在 RAM Disk 組裝完成的成品享有最高寫出優先權，第一時間循序寫回目的資料夾並釋放 RAM Disk。
-- **🧠 動態 CPU 核心借調 (Atomic CPU Token Pool)**：
-  - 保留 1 顆實體核心予 macOS 系統與 GUI 主執行緒 (`os.cpu_count() - 1`)，確保系統流暢不卡頓。
-  - 當部分 Worker 處於 `Idle` 或等待硬碟讀取 (`Queued I/O`) 時，正在進行圖片縮放 (`Resizing`) 的任務會自動借調所有閒置核心進行多執行緒併發加速（例如 `Resizing(12T)`）。
-- **📂 智慧分流與跨磁碟多來源處理**：
-  - 支援拖曳多個來源資料夾批次處理（`.zip`、`.cbz`、`.rar`、`.cbr`、`.7z`），並自動在處理前將未打包的子資料夾預先封裝為 `.zip`。
-  - 自動識別並分流：
-    - **靜態圖片**（`.jpg`, `.png`, `.webp`, `.bmp`, `.gif` 靜態圖）➔ 最佳化縮放為高畫質 JPEG 並封裝為 `.cbz` (`Resized-YYYY-MM-DD/`)
-    - **動態圖片**（多影格動畫 `.gif`, `.webp`）➔ 原檔無損保留並封裝為 `-Animated.zip` (`Animated-YYYY-MM-DD/`)
-    - **影音媒體**（`.mp4`, `.mkv`, `.mov`, `.mp3`, `.flac` 等）➔ 原檔無損保留並封裝為 `-Media.zip` (`Media-YYYY-MM-DD/`)
-    - **原始壓縮檔** ➔ 自動歸檔至各自來源目錄下的 `OriginalFiles-YYYY-MM-DD/`
-    - **損毀壓縮檔** ➔ 自動隔離至 `FileErr-YYYY-MM-DD/` 並產出 `corrupted_search.html` 一鍵搜尋救援清單
-- **📦 雙卡對稱「Pack & Unpack Studio（封裝與解壓工作站）」**：
-  - **即時目錄偵測列 (Live Directory Inspector)**：選擇目標資料夾後，即時掃描並顯示可打包的子資料夾數量與可解壓的壓縮檔數量。
-  - **Quick Folder Packer（子資料夾 ➔ 壓縮檔）**：將目標目錄下的第一層子資料夾批次封裝為零壓縮 `.zip` 或 `.cbz`（`ZIP_STORED / zip -0`），支援自然頁碼排序與原資料夾自動歸檔至 `OriginalFiles-YYYY-MM-DD/`。
-  - **Quick Archive Unpacker（壓縮檔 ➔ `Unzipped-YYYY-MM-DD/`）**：批次解壓 `.zip`、`.cbz`、`.rar`、`.cbr`、`.7z` 至 `Unzipped-YYYY-MM-DD/<檔名>/`，內建 **Smart Flatten（智慧單層化，自動消除 `Book/Book/001.jpg` 雙重巢狀資料夾並清除 `__MACOSX`、`.DS_Store` 垃圾檔）**。
-  - **一鍵往返工作流 (`🎯 Switch to Unzipped`)**：解壓完成並整理圖片後，點擊工具列上的 `🎯 Switch to Unzipped` 即可一鍵切換目標路徑至最新的 `Unzipped-YYYY-MM-DD`，立即透過左卡重新打包回 `.cbz` / `.zip`。
-- **📊 全時期歷史統計資料庫與參數自動記憶**：
-  - 內建 SQLite 資料庫 (`history.db`) 永久記錄每次轉檔的頁數、原始大小、最佳化後大小、節省空間比例與耗時，支援關鍵字篩選、雙擊在 Finder 開啟與匯出 CSV 報表。
-  - 所有介面設定（來源清單、輸出路徑、解析度預設、JPEG 品質、RAM Disk 容量、I/O 限制）皆自動儲存於 `config.json`。
+* **⚡ Multi-Source 批次最佳化 (Comic Optimizer)**：
+  * **多來源匯集**：支援同時添加多個跨硬碟或 NAS 資料夾，一次作業完成轉檔並可統一輸出至指定目錄（留空則各自存回原來源目錄）。
+  * **前置自動封裝**：掃描前自動偵測來源路徑下的第一級子資料夾，預先封裝為 `.zip` 並將原資料夾安全移至 `OriginalFiles-YYYY-MM-DD`。
+  * **智慧分流與畫質最佳化**：靜態圖片自動依設定之解析度上限（預設 4K UHD `3840×2160`）進行等比縮圖與高品質 JPEG 轉換；動態圖（Animated GIF/WebP）與影音檔（MP4/MKV/MP3 等）則原樣抽離並獨立打包，完整保留原始影格時序與畫質。
+* **🧠 記憶體與 CPU 資源動態調度**：
+  * **自動 RAM Disk 分級快取**：依據本機實體記憶體自動掛載高速 RAM Disk（`/Volumes/ComicRamDisk`），大幅降低 SSD 寫入損耗並提升高併發讀寫速度；支援 Strict RAM 嚴格排隊模式。
+  * **原子級 CPU Token 借用池**：微批次（Micro-batching）動態借用閒置或等待 I/O 的核心協助圖片縮放，防止 CPU 過度訂閱（Over-subscription）。
+  * **Disk I/O 併發限流**：自訂硬碟讀寫串流上限，避免外接硬碟或 NAS 發生磁碟抖動（Thrashing）。
+* **📦 Pack & Unpack Studio（雙向封裝與解壓工作站）**：
+  * **Quick Folder Packer**：將一級子資料夾以零壓縮儲存模式（`ZIP_STORED` / `zip -0`）極速封裝為 `.zip` 或 `.cbz`，並依自然排序排列頁碼。
+  * **Quick Archive Unpacker**：支援 `.zip`、`.cbz`、`.rar`、`.cbr`、`.7z` 批次解壓，具備 **Smart Flatten** 自動消除多餘套娃資料夾與 macOS 隱藏垃圾檔（`__MACOSX`、`.DS_Store`）。
+  * **雙層解壓容錯引擎**：優先採用高速 `7zz`，遇到非標準標頭或日文/繁簡特殊編碼 RAR 檔時，自動無縫切換至 `unar` 進行救援解壓。
+* **📊 All-Time 歷史數據與損毀檔案救援**：
+  * 內建 SQLite 紀錄庫追蹤歷次節省空間百分比與耗時，支援 CSV 匯出。
+  * 損毀壓縮檔自動隔離至 `FileErr-YYYY-MM-DD`，並自動生成清洗檔名後的 E-Hentai 搜尋導航網頁（`corrupted_search.html`）。
 
 ---
 
-## 🚀 初次使用必讀：macOS 環境建置指南 (First-Time Setup)
+## 環境需求與依賴安裝
 
-初次在新的 Mac 上使用本程式時，請依序完成以下 **4 個步驟**：
+### 1. 系統工具（透過 Homebrew 安裝）
 
-### 步驟 1：安裝 Homebrew（若尚未安裝）
-
-開啟 macOS「終端機 (Terminal)」，執行以下指令安裝 [Homebrew](https://brew.sh/)：
+本專案依賴 `7zz` 與 `unar` 處理 `.rar`、`.cbr` 與 `.7z` 格式，請先透過 Homebrew 安裝：
 
 ```bash
-/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+brew install sevenzip unar
 ```
 
-> 💡 **Apple Silicon (M1~M5) 注意事項**：安裝完成後，請確認 `/opt/homebrew/bin` 已加入您的 `PATH`（通常安裝腳本會提示執行以下兩行）：
-> ```bash
-> echo 'eval "$(/opt/homebrew/bin/brew shellenv)"' >> ~/.zprofile
-> eval "$(/opt/homebrew/bin/brew shellenv)"
-> ```
+### 2. Python 環境與套件
 
----
-
-### 步驟 2：安裝系統依賴套件（Python 3.11+ 與 7-Zip `7zz`）
-
-本程式需要 **Python 3.11 以上版本**，以及官方命令列解壓縮核心 **`sevenzip` (`7zz`)** 以支援 `.rar` / `.cbr` / `.7z` 格式的高速串流解壓縮：
+建議使用 Python 3.11 或以上版本，並建立獨立虛擬環境：
 
 ```bash
-brew update
-brew install python sevenzip
-```
-
-接著進入專案目錄，將 Homebrew 安裝好的 `7zz` 執行檔複製一份至專案根目錄（確保未來打包 `.app` 或離線執行時皆能直接呼叫）：
-
-```bash
-cd /path/to/comic_optimizer
-cp "$(which 7zz)" ./7zz
-chmod +x ./7zz
-```
-
----
-
-### 步驟 3：建立 Python 虛擬環境 (`.venv`) 並安裝套件
-
-為避免與 macOS 系統環境衝突，建議在專案根目錄下建立獨立的 `.venv` 虛擬環境並安裝 `requirements.txt` 中的套件（包含 `PyQt6`、`Pillow`、`rich`、`tqdm`、`pyinstaller`）：
-
-```bash
-# 1. 建立虛擬環境
+# 建立並啟動虛擬環境
 python3 -m venv .venv
+source .venv/bin/activate
 
-# 2. 升級 pip 並安裝所有依賴套件
-./.venv/bin/pip install --upgrade pip
-./.venv/bin/pip install -r requirements.txt
+# 安裝核心依賴與打包工具
+pip install --upgrade pip
+pip install PyQt6 Pillow pyinstaller
 ```
 
 ---
 
-### 步驟 4：啟動程式
+## 開發模式啟動
 
-環境建置完成後，即可直接透過虛擬環境啟動 GUI 介面：
+在終端機中直接執行 GUI 主程式：
 
 ```bash
-./.venv/bin/python comic_optimizer_gui.py
+python3 comic_optimizer_gui.py
 ```
-
-啟動後，macOS Dock 將顯示專屬的 Apple 風應用程式圖示（[`app_icon.png`](file:///Users/edwardyao/GithubProjects/comic_optimizer/app_icon.png)）。
 
 ---
 
-## 📦 進階：封裝為獨立 macOS `.app` 應用程式（選用）
+## 打包為獨立 macOS `.app` 應用程式
 
-若希望不透過終端機、直接從「應用程式 (Applications)」或 Dock 點擊啟動，可使用專案內已安裝的 `PyInstaller` 將程式、`7zz` 執行檔與 [`app_icon.icns`](file:///Users/edwardyao/GithubProjects/comic_optimizer/app_icon.icns) 打包為原生 `.app`：
+為了讓打包後的 `.app` 具備完整離線執行能力，需先將系統安裝的 `7zz` 與 `unar` 複製到專案根目錄再進行 PyInstaller 建構。
+
+### 1. 準備二進位執行檔與圖示
 
 ```bash
-./.venv/bin/pyinstaller \
-  --noconfirm \
-  --windowed \
-  --name "Comic Optimizer" \
-  --icon "app_icon.icns" \
-  --add-binary "7zz:." \
-  --add-data "app_icon.png:." \
-  --add-data "app_icon.icns:." \
-  comic_optimizer_gui.py
+# 複製 7zz 與 unar 至專案根目錄並賦予執行權限
+cp $(which 7zz) ./7zz
+cp $(which unar) ./unar
+chmod +x ./7zz ./unar
 ```
 
-打包完成後，應用程式將位於 `dist/Comic Optimizer.app`，可直接拖曳至 `/Applications` 資料夾使用。
+*(選用)* 若專案目錄下備有自訂應用程式圖示（`app_icon.icns` 與 `app_icon.png`），建構腳本會自動將其嵌入 App Bundle。
+
+### 2. 執行 PyInstaller 乾淨建構
+
+```bash
+# 清除舊快取並依據規格檔建構
+rm -rf build dist
+pyinstaller --clean ComicOptimizer.spec
+```
+
+### 3. 修復內部權限與移除 macOS 隔離標籤
+
+```bash
+# 確保封裝進 App 內的輔助工具保留執行權限
+chmod +x dist/ComicOptimizer.app/Contents/MacOS/7zz 2>/dev/null || true
+chmod +x dist/ComicOptimizer.app/Contents/MacOS/unar 2>/dev/null || true
+
+# 移除本機 Gatekeeper 隔離屬性 (Quarantine Flag)
+xattr -cr dist/ComicOptimizer.app
+```
+
+### 4. 部署至「應用程式」目錄
+
+```bash
+rm -rf /Applications/ComicOptimizer.app
+cp -R dist/ComicOptimizer.app /Applications/
+```
+
+完成後即可透過 Spotlight（`Cmd + Space`）或 Launchpad 搜尋 **Comic Optimizer** 直接啟動。
 
 ---
 
-## ⚙️ 參數設定建議
+## 專案目錄結構
 
-| 參數項目 | 建議設定值 | 說明 |
-| :--- | :--- | :--- |
-| **Max Resolution** | `4K UHD (3840×2160)` | 長邊不超過 3840px、短邊不超過 2160px（等比例縮放，小圖不放大）；亦可選擇 `2K`、`1080p` 或 `Original Resolution`。 |
-| **JPEG Quality** | `85 %` | 在 4K 解析度下兼顧肉眼無損畫質與最佳檔案體積壓縮比（通常可節省 50%~75% 空間）。 |
-| **RAM Disk** | 系統自動建議值（如 24GB 記憶體建議 `14 GB`） | 設為 `0 GB` 時將停用 RAM Disk 並改用系統暫存區。 |
-| **Strict RAM** | **建議勾選 (`Checked`)** | 強制所有小於 RAM Disk 總容量的壓縮檔 100% 在記憶體磁碟中完成處理，絕不寫入系統 SSD。 |
-| **Disk I/O Limit** | 外接 HDD/RAID 建議 `2 ~ 3 Streams`<br>內建 NVMe SSD 可調至 `6 ~ 8 Streams` | 限制同時從硬碟讀取／寫出的串流數，避免外接陣列尋道滿載而拖慢 CPU 轉檔效率。 |
-
----
-
-## 📁 資料儲存位置
-
-- **設定檔 (`config.json`)**：`~/Library/Application Support/ComicOptimizer/config.json`
-- **歷史統計資料庫 (`history.db`)**：`~/Library/Application Support/ComicOptimizer/history.db`
-
+```text
+comic_optimizer/
+├── comic_optimizer_gui.py   # PyQt6 GUI 主程式與多核心調度引擎
+├── ComicOptimizer.spec      # PyInstaller macOS App Bundle 打包規格檔
+├── AGENT.md                 # AI 開發代理架構規範檔
+├── README.md                # 專案說明文件
+├── .gitignore               # Git 忽略清單（排除二進位檔與建構產物）
+└── app_icon.icns / .png     # 應用程式圖示資源（選用）
+```

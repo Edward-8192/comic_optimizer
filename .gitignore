@@ -1,17 +1,44 @@
+# === 1. Python 編譯快取與虛擬環境 ===
 __pycache__/
 *.py[cod]
-.DS_Store
+*$py.class
+*.so
+.Python
 .venv/
 venv/
+env/
+ENV/
+
+# === 2. PyInstaller 打包產物與暫存 ===
 build/
 dist/
-*.spec
+*.app/
+*.egg-info/
+.eggs/
+# 注意：不要忽略 *.spec，規格檔需要留著做版本控制
+
+# === 3. 外部複製的二進位執行檔 (請透過 Homebrew 安裝) ===
 7zz
-OriginalFiles-*/
-Resized-*/
-Comic-*/
-Animated-*/
-Media-*/
-Processed-*/
-Error-*/
-FileErr-*/
+7z
+unar
+lsar
+
+# === 4. macOS 系統隱藏檔與開發工具快取 ===
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+.Spotlight-V100
+.Trashes
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# === 5. 本機資料庫與暫存檔 ===
+*.db
+*.sqlite
+*.sqlite3
+*.log
+.packing_*.tmp
+.unpacking_*.tmp

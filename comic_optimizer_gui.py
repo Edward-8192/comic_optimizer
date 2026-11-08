@@ -189,6 +189,7 @@ def reveal_in_finder(target_path: Path):
             subprocess.Popen(["open", str(target_path.parent)])
     except Exception:
         pass
+
 MAX_RAM_RETRIES = 150
 RAM_DISK_MOUNT = Path("/Volumes/ComicRamDisk")
 
@@ -388,15 +389,46 @@ def get_app_icon() -> QIcon:
     return QIcon()
 
 def find_7z_binary() -> str:
-    bundled_7zz = get_resource_path("7zz")
-    if os.path.exists(bundled_7zz) and os.access(bundled_7zz, os.X_OK):
-        return bundled_7zz
+    # 1. 檢查 PyInstaller 解壓暫存目錄 (_MEIPASS)
+    if hasattr(sys, '_MEIPASS'):
+        meipass_bin = Path(sys._MEIPASS) / "7zz"
+        if meipass_bin.is_file():
+            return str(meipass_bin)
+
+    # 2. 檢查 macOS .app Bundle 內部的 MacOS 目錄
+    app_macos_bin = Path(sys.executable).parent / "7zz"
+    if app_macos_bin.is_file():
+        return str(app_macos_bin)
+
+    # 3. 檢查系統 PATH (Homebrew 或自訂安裝)
     for binary in ["7zz", "7z"]:
-        if shutil.which(binary):
-            return binary
-    return "7z"
+        system_path = shutil.which(binary)
+        if system_path:
+            return system_path
+
+    # 4. 預設回退
+    return "7zz"
 
 SEVEN_ZIP_BIN = find_7z_binary()
+
+def find_unar_binary() -> str:
+    """尋找 unar 執行檔（支援 PyInstaller 打包路徑與系統 PATH）"""
+    if hasattr(sys, '_MEIPASS'):
+        meipass_bin = Path(sys._MEIPASS) / "unar"
+        if meipass_bin.is_file():
+            return str(meipass_bin)
+
+    app_macos_bin = Path(sys.executable).parent / "unar"
+    if app_macos_bin.is_file():
+        return str(app_macos_bin)
+
+    system_path = shutil.which("unar")
+    if system_path:
+        return system_path
+
+    return None
+
+UNAR_BIN = find_unar_binary()
 
 def sanitize_log_text(text: str) -> str:
     # 僅濾除高位元面補充區的彩色 Emoji，完整保留中日韓漢字 (CJK)、假名與全形標點符號
@@ -534,7 +566,6 @@ def get_uncompressed_size_mb_fast(archive_path: Path) -> float:
         if ext in ('.zip', '.cbz'):
             with zipfile.ZipFile(archive_path, 'r') as zf:
                 total_bytes = sum(zinfo.file_size for zinfo in zf.infolist())
-                # 預留 8% 檔案系統區塊與暫存緩衝
                 return (total_bytes * 1.08) / (1024 * 1024)
         else:
             return (archive_path.stat().st_size * 1.30) / (1024 * 1024)
@@ -592,6 +623,7 @@ def extract_archive_stream(archive_path: Path, extract_dir: Path, progress_callb
     ext = archive_path.suffix.lower()
     start_time = time.time()
     try:
+        # ---- 1. ZIP / CBZ 原生串流解壓 ----
         if ext in ('.zip', '.cbz'):
             try:
                 with zipfile.ZipFile(archive_path, 'r') as zf:
@@ -611,41 +643,77 @@ def extract_archive_stream(archive_path: Path, extract_dir: Path, progress_callb
                 return False, "CORRUPTED"
             except Exception:
                 return False, "CORRUPTED"
+
+        # ---- 2. RAR / 7Z / CBR 解壓 (7zz 優先 + unar 容錯備援) ----
         elif ext in ('.rar', '.cbr', '.7z'):
-            cmd = [SEVEN_ZIP_BIN, "x", str(archive_path), f"-o{extract_dir}", "-y", "-p-", "-bsp1"]
-            try:
-                proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True)
-            except FileNotFoundError:
-                return False, "CORRUPTED"
-            pct_pattern = re.compile(r'(\d+)%')
-            current_pct = 0.0
-            captured_output = []
-            while True:
+            used_7z = False
+            # 優先嘗試 7zz (速度快且支援多執行緒與即時進度百分比)
+            if SEVEN_ZIP_BIN and (shutil.which(SEVEN_ZIP_BIN) or Path(SEVEN_ZIP_BIN).is_file()):
+                cmd = [
+                    SEVEN_ZIP_BIN, "x", str(archive_path), f"-o{extract_dir}",
+                    "-y",          # 自動全部確認
+                    "-p",          # 空密碼直接回車容錯
+                    "-bsp1",       # 輸出進度百分比
+                    "-sccUTF-8",   # 強制控制台與輸出字元集為 UTF-8
+                ]
+                try:
+                    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True)
+                    pct_pattern = re.compile(r'(\d+)%')
+                    current_pct = 0.0
+                    captured_output = []
+                    while True:
+                        if abort_flag is not None and abort_flag.value:
+                            try:
+                                proc.kill()
+                            except Exception:
+                                pass
+                            return False, "ABORTED"
+                        line = proc.stdout.readline()
+                        if not line and proc.poll() is not None:
+                            break
+                        if line:
+                            captured_output.append(line)
+                            matches = pct_pattern.findall(line)
+                            if matches:
+                                current_pct = int(matches[-1]) / 100.0
+                        elapsed = time.time() - start_time
+                        if progress_callback:
+                            progress_callback(current_pct, elapsed)
+                    _, stderr_out = proc.communicate()
+                    if abort_flag is not None and abort_flag.value:
+                        return False, "ABORTED"
+
+                    all_err = "".join(captured_output) + (" " + stderr_out if stderr_out else "")
+                    if any(k in all_err.lower() for k in ["no space left", "not enough space", "disk full", "write error"]):
+                        return False, "NO_SPACE"
+
+                    # 0=成功, 1=非致命警告 (如字元編碼異常但檔案完整解出)
+                    if proc.returncode in (0, 1) and any(extract_dir.iterdir()):
+                        return True, "SUCCESS"
+                    used_7z = True
+                except Exception:
+                    used_7z = True
+
+            # 若 7zz 執行失敗或未安裝，自動呼叫 unar 進行救援
+            unar_exec = UNAR_BIN or shutil.which("unar")
+            if unar_exec:
                 if abort_flag is not None and abort_flag.value:
-                    try:
-                        proc.kill()
-                    except Exception:
-                        pass
                     return False, "ABORTED"
-                line = proc.stdout.readline()
-                if not line and proc.poll() is not None:
-                    break
-                if line:
-                    captured_output.append(line)
-                    matches = pct_pattern.findall(line)
-                    if matches:
-                        current_pct = int(matches[-1]) / 100.0
-                elapsed = time.time() - start_time
-                if progress_callback:
-                    progress_callback(current_pct, elapsed)
-            _, stderr_out = proc.communicate()
-            if abort_flag is not None and abort_flag.value:
-                return False, "ABORTED"
-            if proc.returncode == 0:
-                return True, "SUCCESS"
-            all_err = "".join(captured_output) + (" " + stderr_out if stderr_out else "")
-            if any(k in all_err.lower() for k in ["no space left", "not enough space", "disk full", "write error"]):
-                return False, "NO_SPACE"
+                cmd_unar = [unar_exec, "-f", "-o", str(extract_dir), str(archive_path)]
+                try:
+                    res = subprocess.run(cmd_unar, stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True)
+                    if abort_flag is not None and abort_flag.value:
+                        return False, "ABORTED"
+
+                    err_msg = res.stderr.lower() if res.stderr else ""
+                    if any(k in err_msg for k in ["no space", "disk full", "not enough space"]):
+                        return False, "NO_SPACE"
+
+                    if res.returncode == 0 and any(extract_dir.iterdir()):
+                        return True, "SUCCESS"
+                except Exception:
+                    pass
+
             return False, "CORRUPTED"
     except Exception as e:
         if "No space left on device" in str(e): return False, "NO_SPACE"
@@ -725,7 +793,6 @@ def _process_single_page_task(args):
     idx, img_path, rel_path, out_img_path, max_w, max_h, jpeg_quality = args
     try:
         resize_and_convert_image(img_path, out_img_path, max_w=max_w, max_h=max_h, jpeg_quality=jpeg_quality)
-        # 邊轉邊刪：轉換成功寫入後，立刻刪除暫存原圖，避免 RAM Disk 空間倍增
         if out_img_path.exists() and out_img_path.stat().st_size > 0:
             try:
                 img_path.unlink(missing_ok=True)
@@ -768,7 +835,6 @@ def execute_pipeline(
         processed_dir_tmp.mkdir(parents=True, exist_ok=True)
         staged_out_dir.mkdir(parents=True, exist_ok=True)
 
-        # 階段 1: 透過 Disk I/O 閘門控制併發解壓縮讀取（若有已完成待寫出的任務則優先禮讓）
         if io_controller is not None:
             active_io_streams, waiting_writers, io_lock, max_io_streams = io_controller
             status_dict[worker_id] = {
@@ -845,7 +911,6 @@ def execute_pipeline(
                 borrowed_tokens = 0
                 borrowed_idle_specs = []
                 with cpu_token_lock:
-                    # Idle 或正在排隊等硬碟 I/O (Queued I/O) 的核心皆不耗 CPU，可全數借出協助圖片縮放
                     idle_candidates = [
                         (wid, dict(info)) for wid, info in status_dict.items()
                         if wid != worker_id and info.get("stage", "") in ("Idle", "Queued I/O")
@@ -895,7 +960,6 @@ def execute_pipeline(
         if abort_flag is not None and abort_flag.value:
             return False, "ABORTED", 0, 0
 
-        # 階段 3: 在 RAM Disk / Local Temp 內部瞬間封裝好 ZIP/CBZ，並「邊包邊刪」來源暫存檔以保持零重複空間佔用
         pkg_label = "RAM Build" if tier_tag == "RAM" else "Local Build"
         def update_pkg_progress(ratio: float):
             status_dict[worker_id] = {
@@ -946,7 +1010,6 @@ def execute_pipeline(
         if abort_flag is not None and abort_flag.value:
             return False, "ABORTED", 0, 0
 
-        # 階段 4: 組裝完畢後透過最高優先權 (Write-Priority) 立刻搬往目的地資料夾，瞬間騰出 RAM Disk
         def _flush_to_disk():
             status_dict[worker_id] = {
                 "tier": tier_tag, "stage": "Archiving", "name": archive_path.name,
@@ -1033,7 +1096,6 @@ def worker_task(
 
         if not ok and reason == "NO_SPACE" and temp_target_dir is not None:
             if strict_ram:
-                # 強制 RAM Disk 模式下絕不偷偷退回 SSD，先釋放暫存並排回佇列頂端等待 RAM Disk 空間
                 recent_logs.append(("WARN", clean_name, "RAM Busy -> Wait RAM"))
                 status_dict[worker_id] = {"tier": tier_tag, "stage": "Idle", "name": "-", "progress": 0.0, "detail": ""}
                 return archive_path_str, "RETRY_RAM", time.time() - start_task_time, 0, orig_bytes, 0
@@ -1201,7 +1263,6 @@ def unpack_archive_worker(
         recent_logs.append(("SYS_ERR", clean_name, f"Extract Failed ({reason})"))
         return archive_path_str, "ERROR"
 
-    # 清除 macOS 垃圾目錄與隱藏檔 (__MACOSX, .DS_Store, ._*)
     file_count = 0
     for root, dirs, files in os.walk(temp_extract_dir, topdown=False):
         root_p = Path(root)
@@ -1225,7 +1286,6 @@ def unpack_archive_worker(
         status_dict[worker_id] = {"tier": "-", "stage": "Idle", "name": "-", "progress": 0.0, "detail": ""}
         return archive_path_str, "SKIP"
 
-    # 智慧單層目錄標準化 (Smart Flatten)：若解壓後內層只有唯一一個資料夾且無散落檔案，自動消除多餘的套娃層級
     source_to_move = temp_extract_dir
     if smart_flatten:
         while True:
@@ -1256,7 +1316,6 @@ def unpack_archive_worker(
     return archive_path_str, "SUCCESS"
 
 def terminate_executor_immediately(executor: ProcessPoolExecutor, futures_iterable=()):
-    """立即取消未執行任務並強制終止所有 Worker 行程及其衍生子行程 (如 7zz)，不阻塞等待"""
     for f in list(futures_iterable):
         try:
             f.cancel()
@@ -1359,7 +1418,6 @@ class OptimizerThread(QThread):
                 "out_bytes": 0
             })
 
-        # === 步驟 1: 對所有來源資料夾分別執行前置 Quick Folder Packer ===
         all_pre_sub_dirs = []
         for s_dir in self.source_dirs:
             orig_dest = s_dir / f"OriginalFiles-{today_str}"
@@ -1410,7 +1468,6 @@ class OptimizerThread(QThread):
             _emit_early_abort(0)
             return
 
-        # === 步驟 2: 掃描所有來源資料夾底下的待處理壓縮檔 ===
         archive_items = []
         for s_dir in self.source_dirs:
             for p in s_dir.rglob("*"):
@@ -1487,7 +1544,6 @@ class OptimizerThread(QThread):
                         if result_code == "ABORTED":
                             continue
                         if result_code == "RETRY_RAM":
-                            # 強制 RAM Disk 模式下若發生空間不足，調高該檔預留額度並排回佇列最前端重新在 RAM Disk 執行
                             orig_item["ram_oom_retries"] = orig_item.get("ram_oom_retries", 0) + 1
                             if orig_item["ram_oom_retries"] >= 3:
                                 orig_item["force_ssd"] = True
@@ -1529,9 +1585,6 @@ class OptimizerThread(QThread):
                     self.progress_signal.emit(done_total, len(archive_items))
 
                 while available_workers and pending_queue and not self.is_aborted:
-                    # 按需串流派發 (Just-In-Time Stream Dispatch)：
-                    # 當有任務正在寫出釋放 RAM Disk，或正在讀取解壓的串流數已達 io_limit 時，
-                    # 不提前把多餘任務塞進 Waiting Disk 預佔 RAM Disk 空間，讓閒置核心專心支援 Resizing！
                     if waiting_writers.value > 0:
                         break
                     active_wids = [m["wid"] for m in active_futures.values()]
@@ -1559,12 +1612,10 @@ class OptimizerThread(QThread):
                         with ram_lock:
                             actual_free_mb = get_ram_disk_free_mb()
                             if current_allocated_ram.value <= 0.01:
-                                # 當 RAM Disk 處於淨空狀態時，任何小於 RAM Disk 總容量的檔案皆可直接進駐
                                 if actual_free_mb >= min(effective_needed_mb * 0.90, ram_budget_mb * 0.90):
                                     current_allocated_ram.value += effective_needed_mb
                                     can_allocate = True
                             else:
-                                # 雙重空間檢核：帳面預留與實體剩餘空間皆足夠才放行
                                 if (current_allocated_ram.value + effective_needed_mb <= ram_budget_mb) and (actual_free_mb >= effective_needed_mb):
                                     current_allocated_ram.value += effective_needed_mb
                                     can_allocate = True
@@ -1590,12 +1641,10 @@ class OptimizerThread(QThread):
 
                     if assigned:
                         worker_id = available_workers.pop()
-                        # 立即標記為 Queued I/O，確保迴圈能精確統計 active_readers
                         worker_statuses[worker_id] = {
                             "tier": target_tier, "stage": "Queued I/O",
                             "name": chosen_item["path"].name, "progress": 0.0, "detail": "Starting"
                         }
-                        # 動態計算該檔案的產出目錄
                         src_root = chosen_item["src_root"]
                         dest_root = self.global_output_dir if self.global_output_dir else src_root
                         
@@ -1604,7 +1653,6 @@ class OptimizerThread(QThread):
                         media_dir = dest_root / f"Media-{today_str}"
                         error_dir = dest_root / f"Error-{today_str}"
                         file_err_dir = dest_root / f"FileErr-{today_str}"
-                        # 原檔固定搬移到原本所屬資料夾
                         original_files_dir = src_root / f"OriginalFiles-{today_str}"
 
                         f = executor.submit(
@@ -1641,7 +1689,6 @@ class OptimizerThread(QThread):
 
         total_cost = time.time() - global_start_time
 
-        # 彙整產出損毀檔案 HTML 與清單
         report_dest_dir = self.global_output_dir if self.global_output_dir else self.source_dirs[0]
         file_err_dest = report_dest_dir / f"FileErr-{today_str}"
 
@@ -1670,7 +1717,6 @@ class OptimizerThread(QThread):
             except Exception:
                 pass
 
-        # 空間統計計算 (以本次執行實際處理的檔案大小為準)
         total_orig_bytes = session_orig_bytes
         total_out_bytes = session_out_bytes
 
@@ -1979,7 +2025,6 @@ class DropLineEdit(QLineEdit):
                 break
 
 class DropListWidget(QListWidget):
-    """支援直接拖曳多個資料夾加入清單並具備空白引導與高亮的自訂 ListWidget"""
     items_changed_signal = pyqtSignal()
 
     def __init__(self, parent=None):
@@ -2131,7 +2176,6 @@ class MainWindow(QMainWindow):
         layout_opt.setContentsMargins(12, 12, 12, 12)
         layout_opt.setSpacing(10)
 
-        # 複數來源清單區
         src_box = QHBoxLayout()
         self.sources_list = DropListWidget()
         self.sources_list.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
@@ -2160,7 +2204,6 @@ class MainWindow(QMainWindow):
         src_box.addLayout(src_btn_layout, stretch=1)
         layout_opt.addLayout(src_box)
 
-        # 輸出目的資料夾列 (可選)
         row_out = QHBoxLayout()
         self.path_output_opt = DropLineEdit()
         self.path_output_opt.setPlaceholderText("Output destination (Optional, leave empty to save into each source folder)...")
@@ -2180,7 +2223,6 @@ class MainWindow(QMainWindow):
         row_out.addWidget(clear_out_btn)
         layout_opt.addLayout(row_out)
 
-        # 控制與啟動列 (包含畫質與解析度 Preset)
         row_ctrl = QHBoxLayout()
         row_ctrl.setSpacing(10)
 
@@ -2246,13 +2288,12 @@ class MainWindow(QMainWindow):
 
         self.tabs.addTab(tab_opt, "⚡ Comic Optimizer (Multi-Source & Resize)")
 
-        # ---- Tab 2: Pack & Unpack Studio (Dual-Card Symmetrical Workspace) ----
+        # ---- Tab 2: Pack & Unpack Studio ----
         tab_pack = QWidget()
         layout_pack = QVBoxLayout(tab_pack)
         layout_pack.setContentsMargins(12, 10, 12, 10)
         layout_pack.setSpacing(8)
 
-        # Shared Target Directory Bar + Live Inspector Badge
         row_pack = QHBoxLayout()
         row_pack.setSpacing(8)
         self.path_input_pack = DropLineEdit()
@@ -2292,7 +2333,6 @@ class MainWindow(QMainWindow):
         row_pack.addWidget(self.use_unzipped_btn)
         layout_pack.addLayout(row_pack)
 
-        # Live Directory Inspector Bar
         inspect_bar = QHBoxLayout()
         inspect_bar.setContentsMargins(2, 0, 2, 0)
         self.pack_inspect_label = QLabel("💡 Select or drop a target directory above to inspect subfolders & archives.")
@@ -2303,11 +2343,9 @@ class MainWindow(QMainWindow):
         inspect_bar.addWidget(self.pack_inspect_label, stretch=1)
         layout_pack.addLayout(inspect_bar)
 
-        # Dual Action Cards (Left: Quick Folder Packer | Right: Quick Archive Unpacker)
         cards_row = QHBoxLayout()
         cards_row.setSpacing(12)
 
-        # --- Left Card: Quick Folder Packer ---
         pack_card = QFrame()
         pack_card.setStyleSheet("""
             QFrame {
@@ -2365,7 +2403,6 @@ class MainWindow(QMainWindow):
         pack_card_layout.addStretch()
         pack_card_layout.addWidget(self.start_btn_pack)
 
-        # --- Right Card: Quick Archive Unpacker ---
         unpack_card = QFrame()
         unpack_card.setStyleSheet("""
             QFrame {
@@ -2431,13 +2468,12 @@ class MainWindow(QMainWindow):
 
         self.tabs.addTab(tab_pack, "📦 Pack & Unpack Studio")
 
-        # ---- Tab 3: History & Statistics (Full-Height Workspace) ----
+        # ---- Tab 3: History & Statistics ----
         tab_hist = QWidget()
         layout_hist = QVBoxLayout(tab_hist)
         layout_hist.setContentsMargins(12, 12, 12, 12)
         layout_hist.setSpacing(12)
 
-        # 頂部 4 張大字體 KPI 數據卡
         kpi_row = QHBoxLayout()
         kpi_row.setSpacing(12)
 
@@ -2460,7 +2496,6 @@ class MainWindow(QMainWindow):
         kpi_row.addWidget(c4, stretch=1)
         layout_hist.addLayout(kpi_row)
 
-        # 搜尋與管理列
         hist_ctrl_layout = QHBoxLayout()
         self.hist_search_input = QLineEdit()
         self.hist_search_input.setPlaceholderText("🔍 Filter by filename, source path, or status (SUCCESS / FILE_ERR)...")
@@ -2483,7 +2518,6 @@ class MainWindow(QMainWindow):
         hist_ctrl_layout.addWidget(clear_hist_btn)
         layout_hist.addLayout(hist_ctrl_layout)
 
-        # 歷史明細表格 (雙擊可在 Finder 開啟)
         self.history_table = QTableWidget(0, 8)
         self.history_table.setHorizontalHeaderLabels([
             "Timestamp", "Filename (Double-click to open folder)", "Status", "Pages",
@@ -2513,7 +2547,6 @@ class MainWindow(QMainWindow):
         self.tabs.currentChanged.connect(self.on_tab_changed)
         main_layout.addWidget(self.tabs)
 
-        # ---- 即時執行監控區 (切換到 Tab 3 時自動隱藏，將空間留給歷史大表) ----
         self.monitor_container = QWidget()
         monitor_layout = QVBoxLayout(self.monitor_container)
         monitor_layout.setContentsMargins(0, 0, 0, 0)
@@ -2711,7 +2744,6 @@ class MainWindow(QMainWindow):
         self.start_btn_pack.setText(f"📦  Pack Subfolders ({subfolders_cnt})")
         self.start_btn_unpack.setText(f"📂  Unpack Archives ({archives_cnt})")
 
-        # Configure the round-trip quick-switch button
         if p.name.startswith("Unzipped-") and p.parent.is_dir():
             self.use_unzipped_btn.setEnabled(True)
             self.use_unzipped_btn.setText("⬆️ Back to Parent Folder")
